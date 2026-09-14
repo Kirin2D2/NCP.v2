@@ -741,6 +741,8 @@ def run_one(args):
         'seed':                  args.seed,
         'spurious_subspace':     args.spurious_subspace,
         'subspace_dims':         list(args.subspace_dims),
+        'pr_step':               args.pr_step,
+        'total_pr':              args.total_pr,
         'iter_finetune_epochs':  args.iter_finetune_epochs,
         'rank_loader_type':      args.rank_loader_type,
         'eval_on_test':          args.eval_on_test,
