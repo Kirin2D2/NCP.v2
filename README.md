@@ -1,5 +1,7 @@
 # Concept-aware Network Pruning (CNP)
 
+Check out our [demo notebook](https://colab.research.google.com/github/Kirin2D2/NCP.v2/blob/main/notebooks/cnp_watermark_figures.ipynb) on Colab!
+
 Code for **"Concept-Aware Pruning via Disentangled Subspaces for Robust Convolutional Networks"**
 (Kirin Danek and Vikram V. Ramaswamy, XAI4CV Workshop at CVPR 2026).
 
