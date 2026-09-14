@@ -21,6 +21,7 @@
 #SBATCH --time=12:00:00
 
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # job logs update live
 
 # Activate your environment, e.g.:
 #   source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate cnp

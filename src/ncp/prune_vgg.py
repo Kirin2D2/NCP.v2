@@ -571,15 +571,10 @@ class PruningFineTuner:
         # spawned workers start fresh Python interpreters with no CUDA state, so they can
         # safely initialize their own CUDA contexts. This allows num_workers>0 (prefetching)
         # without deadlocking even after model.cuda() has been called in the parent.
-        if self.args.cuda:
-            kwargs = {
-                'num_workers': 3,
-                'pin_memory': True,
-                'multiprocessing_context': 'spawn',
-                'persistent_workers': True,
-            }
-        else:
-            kwargs = {}
+        num_workers = getattr(self.args, 'num_workers', None)
+        if num_workers is None:
+            num_workers = dataset.default_num_workers(self.args.cuda)
+        kwargs = dataset.loader_kwargs(self.args.cuda, num_workers)
 
         # Subclasses (e.g. WatermarkPruningFineTuner) override this method with their own loaders.
         data_type = self.args.data_type.lower()
@@ -886,7 +881,7 @@ class PruningFineTuner:
             self.model.augmented = True
 
         for kk in range(iterations):
-            print("Ranking filters.. {}".format(kk))
+            print("Ranking filters.. {}".format(kk), flush=True)
             self.niter += 1
             prune_targets = self.get_candidates_to_prune(num_filters_to_prune_per_iteration)
 

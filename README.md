@@ -99,7 +99,8 @@ test split. The choice is recorded in each `stats.pt`.
 An example SLURM array is in [`scripts/slurm/watermark_pruning.slurm`](scripts/slurm/watermark_pruning.slurm).
 
 **Colab notebook:** [`notebooks/cnp_watermark_figures.ipynb`](notebooks/cnp_watermark_figures.ipynb)
-runs the same configuration on a Colab GPU. It downloads the data, runs CNP and vanilla pruning per seed
+runs the paper configuration on a Colab GPU, pruning to 40% by default for speed
+(set `TOTAL_PR = 0.80` for the full schedule). It downloads the data, runs CNP and vanilla pruning per seed
 (resumable, with optional storage in Google Drive), and plots Figures 3–4: overall and worst-subgroup (c0w1)
 accuracy vs. filters pruned.
 

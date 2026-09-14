@@ -14,6 +14,7 @@
 # Subspaces are 0-indexed: carton ablates 3 (paper "subspace 4"), crate ablates 1 (paper "subspace 2").
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PYTHONUNBUFFERED=1   # logs update live when output is redirected to a file
 
 EXPERIMENTS=${1:-all}
 PRUNERS=${2:-all}

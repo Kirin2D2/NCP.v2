@@ -9,6 +9,7 @@ CLI/file identifier for CNP).
 Paper figures:
   top    (overall accuracy):  {experiment}_accuracy.png        (--no_titles)
   bottom (c0w1 OOD accuracy): {experiment}_c0w1_combined.png   (--c0w1_only --no_titles)
+Shorter runs (e.g. the notebook default, 40%): add --total_pr 0.40 --xtick_step 5.
 
 By default, produces four figures per experiment (carton / crate):
 
@@ -68,6 +69,7 @@ MS         = 4
 ALPHA_BAND = 0.18
 PR_STEP        = 0.05                          # fraction of filters pruned per iteration
 MAX_PRUNE_ITER = int(round(0.80 / PR_STEP))   # = 16; iter 17 is final fine-tune, not pruning
+XTICK_STEP     = 20                            # x-axis tick spacing in % (paper figures); 5 = every step
 
 # Font sizes for paper figures
 FS_LABEL  = 13   # axis labels
@@ -120,9 +122,14 @@ def _scale100(d):
     return {n: v * 100 for n, v in d.items()}
 
 
+def _max_pct():
+    """% of filters pruned after the last plotted pruning iteration (80 for the paper runs)."""
+    return int(round(MAX_PRUNE_ITER * PR_STEP * 100))
+
+
 def _niters_to_pct(niters):
-    """Convert pruning iteration indices to % filters pruned (capped at 80%)."""
-    return [min(int(round(n * PR_STEP * 100)), 80) for n in niters]
+    """Convert pruning iteration indices to % filters pruned (capped at the last pruning step)."""
+    return [min(int(round(n * PR_STEP * 100)), _max_pct()) for n in niters]
 
 
 def _load_seeds(results_dir, experiment, pruner, seeds):
@@ -161,8 +168,9 @@ def _style_ax(ax, xlabel='Filters pruned (%)', ylabel=None):
     if ylabel:
         ax.set_ylabel(ylabel, fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
-    ax.set_xlim(left=0, right=83)
-    ax.set_xticks([0, 20, 40, 60, 80])
+    max_pct = _max_pct()
+    ax.set_xlim(left=0, right=max_pct * 83 / 80)       # 83 for the paper's 80% runs
+    ax.set_xticks(list(range(0, max_pct + 1, XTICK_STEP)))
     ax.xaxis.set_tick_params(labelsize=FS_TICK)
 
 
@@ -342,6 +350,7 @@ def plot_experiment(results_dir, experiment, seeds, out_dir):
 
 
 def main():
+    global MAX_PRUNE_ITER, XTICK_STEP
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--results_dir', default='results/watermark_experiment/',
@@ -357,9 +366,15 @@ def main():
                    help='Suppress all axes and figure titles (for paper figures). '
                         'Only affects accuracy and c0w1_combined plots when combined '
                         'with the relevant flags.')
+    p.add_argument('--total_pr', type=float, default=0.80,
+                   help='Total pruning fraction of the runs; pruning steps up to it are plotted.')
+    p.add_argument('--xtick_step', type=int, default=20,
+                   help='x-axis tick spacing in %% (e.g. 5 to mark every 5%% pruning step).')
     args = p.parse_args()
 
     out_dir = args.out_dir or str(Path(args.results_dir) / 'plots')
+    MAX_PRUNE_ITER = int(round(args.total_pr / PR_STEP))
+    XTICK_STEP = args.xtick_step
 
     for exp in args.experiments:
         ncp_ds = _load_seeds(args.results_dir, exp, 'ncp',     args.seeds)
