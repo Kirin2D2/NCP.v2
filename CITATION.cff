@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper below."
+title: "Concept-aware Network Pruning (CNP)"
+repository-code: "https://github.com/KirinDanek/NCP.v2"
+authors:
+  - family-names: Danek
+    given-names: Kirin
+    affiliation: Princeton University
+  - family-names: Ramaswamy
+    given-names: Vikram V.
+    affiliation: Princeton University
+preferred-citation:
+  type: conference-paper
+  title: "Concept-Aware Pruning via Disentangled Subspaces for Robust Convolutional Networks"
+  authors:
+    - family-names: Danek
+      given-names: Kirin
+    - family-names: Ramaswamy
+      given-names: Vikram V.
+  collection-title: "XAI4CV Workshop at the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)"
+  year: 2026
+  url: "https://xai4cv-workshop.github.io/xai4cv2026/assets/papers/PP29.pdf"

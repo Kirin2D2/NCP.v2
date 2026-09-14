@@ -1,4 +1,4 @@
-### Indices of /n/fs/ncp/NCP.v2/data/images/carton_dugong/original/n02971356 [800:1200] that are not clean (already watermarked)
+### Indices of data/images/carton_dugong/original/n02971356 [800:1200] that are not clean (already watermarked)
 812
 818
 833

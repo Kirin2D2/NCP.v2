@@ -1,54 +1,69 @@
+"""
+Build the negative class for the basketball experiment: a few images from each of many random
+ImageNet-1k synsets (excluding basketball, n02802426), saved as
+
+  data/images/imagenet_430_binary/not_basketball/<wnid>/<original filename>
+
+torchvision's ImageFolder walks subdirectories, so all of these become class 'not_basketball'.
+Downloading from image-net.org requires an account that has accepted the ImageNet terms of access.
+The exact negative images used in the paper were not recorded; with the same seed this
+reproduces the synset sample, not necessarily the identical files.
+
+Usage
+-----
+  python data/images/download_random_images.py
+  python data/images/download_random_images.py --num_classes 110 --images_per_class 10 --seed 42
+"""
+
+import argparse
 import os
 import random
 import tarfile
 import urllib.request
 from pathlib import Path
 
-# ---- CONFIG ----
-OUTPUT_DIR = Path("imagenet_430_binary/not_basketball")
 BASKETBALL_SYNSET = "n02802426"
-SYNSET_LIST_URL = "https://image-net.org/api/wordpress/?synsetids=true"  # fallback if you need one
 BASE_URL = "https://image-net.org/data/winter21_whole"
-NUM_CLASSES = 110
-NUM_IMAGES_PER_CLASS = 10
+IMAGES_DIR = Path(__file__).resolve().parent
 
-# ---- Setup ----
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# You need a list of 1000+ valid synset IDs
-# Option A: hardcoded from download page or .txt file
-# Option B: load from local file or ImageNet’s public list
-with open("imagenet_synsets.txt", "r") as f:
-    all_synsets = [line.strip() for line in f if line.strip() != BASKETBALL_SYNSET]
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--synset_list", type=Path, default=IMAGES_DIR / "imagenet_synsets.txt",
+                   help="Text file with one ImageNet-1k synset ID per line.")
+    p.add_argument("--out_dir", type=Path, default=IMAGES_DIR / "imagenet_430_binary" / "not_basketball")
+    p.add_argument("--num_classes", type=int, default=110)
+    p.add_argument("--images_per_class", type=int, default=10)
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
 
-# Sample 100 random synsets
-random.seed(42)
-chosen_synsets = random.sample(all_synsets, NUM_CLASSES)
+    with open(args.synset_list) as f:
+        all_synsets = [line.strip() for line in f if line.strip() and line.strip() != BASKETBALL_SYNSET]
 
-# ---- Download Loop ----
-for synset in chosen_synsets:
-    print(f"Processing synset {synset}...")
-    tar_url = f"{BASE_URL}/{synset}.tar"
-    tar_path = f"{synset}.tar"
-    try:
-        # download .tar
-        urllib.request.urlretrieve(tar_url, tar_path)
+    random.seed(args.seed)
+    chosen = random.sample(all_synsets, args.num_classes)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
-        # extract 10 files only
-        with tarfile.open(tar_path) as tar:
-            members = [m for m in tar.getmembers() if m.name.endswith(".JPEG")]
-            if len(members) < NUM_IMAGES_PER_CLASS:
-                print(f"  Skipping {synset}: only {len(members)} images")
-                continue
-            dest_dir = OUTPUT_DIR / synset
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            for m in members[:NUM_IMAGES_PER_CLASS]:
-                tar.extract(m, path=dest_dir)
+    for synset in chosen:
+        print(f"Processing synset {synset}...")
+        tar_path = args.out_dir / f"{synset}.tar"
+        try:
+            urllib.request.urlretrieve(f"{BASE_URL}/{synset}.tar", tar_path)
+            with tarfile.open(tar_path) as tar:
+                members = [m for m in tar.getmembers() if m.name.lower().endswith((".jpeg", ".jpg"))]
+                if len(members) < args.images_per_class:
+                    print(f"  Skipping {synset}: only {len(members)} images")
+                    continue
+                dest_dir = args.out_dir / synset
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                for m in members[:args.images_per_class]:
+                    tar.extract(m, path=dest_dir)
+        except Exception as e:
+            print(f"  Failed to process {synset}: {e}")
+        finally:
+            if tar_path.exists():
+                os.remove(tar_path)
 
-        # cleanup
-        os.remove(tar_path)
 
-    except Exception as e:
-        print(f"  Failed to process {synset}: {e}")
-        if os.path.exists(tar_path):
-            os.remove(tar_path)
+if __name__ == "__main__":
+    main()

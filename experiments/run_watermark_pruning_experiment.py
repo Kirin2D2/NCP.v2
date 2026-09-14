@@ -1,49 +1,55 @@
 """
 run_watermark_pruning_experiment.py
 
-Tests whether NCP can ablate spurious hanzi-watermark subspaces from VGG16's
-decision strategy for a binary carton/dugong or crate/packet ImageNet task.
+Tests whether CNP (Concept-aware Network Pruning) can ablate a spurious hanzi-watermark
+subspace from VGG16's decision strategy for a binary carton/dugong or crate/packet ImageNet
+task (paper Section 4.2.2, Figures 3-4).
+
+"ncp" is the CLI/file identifier for CNP (the method's earlier name): --pruner ncp.
 
 Experiment design
 -----------------
 For each (experiment, pruner, seed) combination:
 
-  1. Build dataset with on-the-fly synthetic watermarks:
+  1. Build dataset with on-the-fly synthetic watermarks (per class, sorted filename order):
        - Val:    first 150 pos + 150 neg, each in WM and NWM form → 600 entries
-                 → used as the eval set during hyperparameter sweeps
        - Train:  next 650 pos (325 WM + 325 NWM) + 650 neg (all NWM)
                  → watermark is a spurious cue correlated only with positive class
        - Rank:   positive-only: 500 pos; full-loader: 250 pos + 250 neg
                  → used exclusively for LRP filter-importance scoring
-       - Test:   remaining images, each in WM and NWM form (held out until final eval)
+       - Test:   remaining images, each in WM and NWM form
                  → evaluates all four subgroups c1w1/c1w0/c0w1/c0w0
 
-  2. Warm-start classifier head (up to 15 epochs, early stopping).
+  2. Warm-start classifier head (15 epochs).
 
-  3. Run NCP or vanilla iterative prune-fine-tune loop.
-       NCP: ablates `--spurious_subspace` from the DRSA projection matrix U.
+  3. Run CNP (--pruner ncp) or vanilla LRP iterative prune-fine-tune loop.
+       CNP: ablates `--spurious_subspace` from the DRSA projection matrix U.
        Vanilla: standard LRP-based filter pruning on plain VGG16.
 
   4. Save per-iteration subgroup + overall statistics to
        {out_dir}/{experiment}/{pruner}/seed{seed}/stats.pt
-     (no model weights saved unless --save_model is set).
+     and, with --save_model, the final pruned model to
+       {out_dir}/{experiment}/{pruner}/seed{seed}/{pruner}.pt  (see ncp.checkpoint)
+
+Evaluation set
+--------------
+Every evaluation (baseline, after each pruning iteration, and after final fine-tuning) uses the
+same loader: the validation split by default, or the held-out test split with --eval_on_test.
+The choice is recorded as 'eval_on_test' in stats.pt.
+
+Subspace indices are 0-indexed; the paper numbers subspaces from 1
+(carton: paper subspace 4 == --spurious_subspace 3; crate: paper subspace 2 == 1).
 
 Usage
 -----
-# Single run:
-python run_watermark_pruning_experiment.py \\
-    --experiment carton \\
-    --pruner ncp \\
-    --spurious_subspace 2 \\
-    --seed 0 \\
-    --out_dir /n/fs/ncp/NCP.v2/results/watermark_experiment/
+# Paper configuration (carton, one seed):
+python experiments/run_watermark_pruning_experiment.py \\
+    --experiment carton --pruner ncp --spurious_subspace 3 --seed 0 --eval_on_test
 
-# SLURM array: see watermark_pruning.slurm
+# All seeds / pruners / experiments: scripts/reproduce_watermark.sh
 """
 
 import argparse
-import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -53,15 +59,13 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from PIL import Image
 
-_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-sys.path.insert(0, os.path.join(_root, 'src'))
-sys.path.insert(0, os.path.join(_root, 'watermark'))
-
 from sklearn.metrics import average_precision_score
-from AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16
-from prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
-from watermark_transform import AddWatermark
-from lrp import lrp as lrp_fn
+from ncp.AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16, load_u_matrix
+from ncp.checkpoint import save_pruned_checkpoint
+from ncp.lrp import lrp as lrp_fn
+from ncp.paths import IMAGES_DIR, PROJECTION_DIR, RESULTS_ROOT
+from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
+from ncp.watermark_transform import AddWatermark
 
 
 # ---------------------------------------------------------------------------
@@ -74,17 +78,17 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 #   pos_dir  — directory containing positive-class images (unwatermarked originals)
 #   neg_dir  — directory containing negative-class images
 #   u_path   — DRSA projection matrix (.pt)
+# Download images with data/images/download_binary_dataset.py; override the root with NCP_DATA_ROOT.
 EXPERIMENT_CONFIGS = {
     'carton': {
-        'pos_dir': '/n/fs/ncp/NCP.v2/data/images/carton_dugong/original/n02971356',
-        'neg_dir': '/n/fs/ncp/NCP.v2/data/images/carton_dugong/original/n02074367',
-        'u_path':  '/n/fs/ncp/NCP.v2/data/projection_matrices/U_carton_tensor.pt',
+        'pos_dir': IMAGES_DIR / 'carton_dugong' / 'original' / 'n02971356',   # carton
+        'neg_dir': IMAGES_DIR / 'carton_dugong' / 'original' / 'n02074367',   # dugong
+        'u_path':  PROJECTION_DIR / 'U_carton_tensor.pt',
     },
     'crate': {
-        # n03127925_binary/target: 1113 original full-size crate images
-        'pos_dir': '/n/fs/ncp/NCP.v2/data/images/crate_packet/imagenet_n03127925_binary/target',
-        'neg_dir': '/n/fs/ncp/NCP.v2/data/images/crate_packet/imagenet_crate_packet_original/n03871628',
-        'u_path':  '/n/fs/ncp/NCP.v2/data/projection_matrices/U_crate_tensor.pt',
+        'pos_dir': IMAGES_DIR / 'crate_packet' / 'original' / 'n03127925',    # crate
+        'neg_dir': IMAGES_DIR / 'crate_packet' / 'original' / 'n03871628',    # packet
+        'u_path':  PROJECTION_DIR / 'U_crate_tensor.pt',
     },
 }
 
@@ -94,14 +98,14 @@ SUBSPACE_DIMS = [128, 128, 128, 128]   # 4 subspaces × 128 dims each
 # Layout (per class, sorted order):
 #   [0 : N_VAL]                        → validation
 #   [N_VAL : N_VAL+N_TRAIN_POS/NEG]    → train / rank pool
-#   [N_VAL+N_TRAIN_POS/NEG : ...]      → test  (same boundary as before: index 800)
+#   [N_VAL+N_TRAIN_POS/NEG : ...]      → test  (starts at index 800)
 N_VAL       = 150    # validation images per class (WM+NWM copies → 600 val entries total)
-N_TRAIN_POS = 650    # positive-class images for fine-tuning  (was 800; 150 moved to val)
+N_TRAIN_POS = 650    # positive-class images for fine-tuning
 N_TRAIN_NEG = 650    # negative-class images for fine-tuning
 N_RANK_POS  = 500    # positive-only: all 500 pos; full-loader: first 250 pos
 N_RANK_NEG  = 250    # full-loader only: 250 neg → 250+250=500 total (matches pos-only)
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.JPEG', '.png', '.PNG', '.JPEG'}
+IMAGE_EXTS = {'.jpg', '.jpeg', '.JPEG', '.png', '.PNG'}
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,10 @@ class NaturalTestDataset(Dataset):
 def _list_images(directory):
     """Return sorted list of image file paths in a directory."""
     p = Path(directory)
+    if not p.is_dir():
+        raise FileNotFoundError(
+            f"Image directory not found: {p}\n"
+            f"Download it with data/images/download_binary_dataset.py or set NCP_DATA_ROOT.")
     return sorted(str(f) for f in p.iterdir() if f.suffix in IMAGE_EXTS)
 
 
@@ -216,7 +224,7 @@ def build_splits(pos_dir, neg_dir,
         + [(f, 0, 0) for f in val_neg] + [(f, 0, 1) for f in val_neg]
     )
 
-    # Train: even-index positive → WM=1; odd-index → WM=0  (deterministic 50/50)
+    # Train: even-index positive → WM=0; odd-index → WM=1  (deterministic 50/50)
     train_samples = (
         [(f, 1, i % 2) for i, f in enumerate(train_pos)]
         + [(f, 0, 0) for f in train_neg]
@@ -269,28 +277,30 @@ def _index_from_path(path):
     return int(Path(path).stem.split('_')[-1])
 
 
-def build_natural_test_samples(pos_dir, neg_dir, test_indices_path, n_test=400):
+def build_natural_test_samples(pos_dir, neg_dir, test_indices_path, n_test=400,
+                               start=N_VAL + N_TRAIN_POS):
     """
     Build a balanced test sample list using *natural* watermark labels.
 
-    Carton (pos): images at sorted positions [800 : 800+n_test].
+    Carton (pos): images at sorted positions [start : start+n_test].
       WM=1 if the filename index appears in test_indices_path, else WM=0.
-    Dugong (neg): images at sorted positions [800 : 800+n_test].
+    Dugong (neg): images at sorted positions [start : start+n_test].
       WM=0 for all (dugong has no natural watermarks).
 
-    n_test is capped by the available test images for either class.
+    `start` defaults to the first test-split position (800). n_test is capped by the
+    available test images for either class.
     """
     wm_set  = _load_natural_wm_indices(test_indices_path)
     pos_all = _list_images(pos_dir)
     neg_all = _list_images(neg_dir)
 
-    n_test = min(n_test, len(pos_all) - 800, len(neg_all) - 800)
+    n_test = min(n_test, len(pos_all) - start, len(neg_all) - start)
 
     samples = []
-    for path in pos_all[800 : 800 + n_test]:
+    for path in pos_all[start : start + n_test]:
         wm = 1 if _index_from_path(path) in wm_set else 0
         samples.append((path, 1, wm))
-    for path in neg_all[800 : 800 + n_test]:
+    for path in neg_all[start : start + n_test]:
         samples.append((path, 0, 0))
 
     n_wm = sum(w for _, _, w in samples)
@@ -305,7 +315,7 @@ def make_loaders(train_samples, rank_pos_samples, rank_neg_samples,
     """Construct train / rank / val / test DataLoaders from sample lists.
 
     rank_loader_type:
-      'positive_only' — rank loader uses all rank_pos_samples (500 pos).
+      'positive_only' — rank loader uses all rank_pos_samples (500 pos). Used in the paper.
       'full_loader'   — rank loader uses rank_pos_samples[:250] + rank_neg_samples
                         (250 pos + 250 neg = 500 total).
     """
@@ -347,11 +357,10 @@ class WatermarkPruningFineTuner(PruningFineTuner):
     Pruning fine-tuner for the watermark spurious-cue experiment.
 
     Differences from PruningFineTuner:
-      - setup_dataloaders uses pre-built WatermarkDataset loaders instead of
-        calling data.py, so no changes to data.py are needed.
-      - self.test_loader is set to val_loader during the hyperparameter sweep so
-        that PruningFineTuner.test() evaluates on val; held-out test data lives in
-        self._held_out_test_loader and is not touched during the sweep.
+      - setup_dataloaders uses pre-built WatermarkDataset loaders instead of data.py.
+      - self.test_loader, used for every evaluation during and after pruning, is the val
+        loader by default and the held-out test loader with --eval_on_test. With
+        --natural_test it is replaced by the natural-watermark test set.
       - get_candidates_to_prune temporarily swaps to a dedicated rank_loader
         for LRP filter scoring (500 pos or 250 pos+250 neg), then restores
         train_loader for subsequent fine-tuning. This mirrors the
@@ -414,14 +423,12 @@ class WatermarkPruningFineTuner(PruningFineTuner):
                 nat_ds, batch_size=self.args.test_batch_size,
                 shuffle=False, **worker_kw)
         else:
-            # Default: evaluate on val during sweeps, held-out test with --eval_on_test.
+            # All evaluations use one loader: val by default, held-out test with --eval_on_test.
             use_test = getattr(self.args, 'eval_on_test', False)
             self.test_loader = test_loader if use_test else val_loader
 
         self.train_num    = len(train_loader)
         self.test_num     = len(self.test_loader)
-        # Required by PruningFineTuner (used in run_PFT.py log, empty here)
-        self.eval_supplement_fnames = []
 
     # ------------------------------------------------------------------
     # LRP scoring: use rank_loader (positive-class only)
@@ -444,7 +451,7 @@ class WatermarkPruningFineTuner(PruningFineTuner):
         return result
 
     # ------------------------------------------------------------------
-    # Per-subspace LRP relevance and AP (NCP only, natural test set)
+    # Per-subspace LRP relevance and AP (CNP only, natural test set)
     # ------------------------------------------------------------------
 
     def _compute_subspace_relevances(self):
@@ -452,7 +459,7 @@ class WatermarkPruningFineTuner(PruningFineTuner):
         Compute per-subspace LRP relevance on self.test_loader, projecting
         through the ORIGINAL (non-ablated) U matrix rather than the ablated
         encode/decode.  This gives a meaningful signal across pruning iterations:
-        as NCP removes filters associated with the ablated subspace, the relevance
+        as CNP removes filters associated with the ablated subspace, the relevance
         attributable to that subspace via the original U should decrease.
 
         Method:
@@ -465,9 +472,11 @@ class WatermarkPruningFineTuner(PruningFineTuner):
         Returns a dict with keys:
           niter, mean_all, mean_wm0, mean_wm1,
           ap_wm (K,), ap_class (K,)
-        or None if U_orig is not set or test_loader is absent.
+        or None if U_orig is not set, test_loader is absent, or the model is a
+        vanilla VGG16 (no before/after split).
         """
-        if self._U_orig is None or not hasattr(self, 'test_loader'):
+        if (self._U_orig is None or not hasattr(self, 'test_loader')
+                or not hasattr(self.model, 'before')):
             return None
 
         self.model.eval()
@@ -582,8 +591,8 @@ class WatermarkPruningFineTuner(PruningFineTuner):
 
 def build_model(args, u_path):
     if args.pruner == 'ncp':
-        U = torch.load(u_path, map_location='cpu', weights_only=False).float()
-        U_ab, U_ab_T = ablate_subspace_matrix(U, SUBSPACE_DIMS, list(args.spurious_subspace))
+        U = load_u_matrix(u_path)
+        U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
         model = AugmentedVGG16(U_ab, U_ab_T)
     else:
         model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
@@ -596,15 +605,15 @@ def build_model(args, u_path):
 
 
 # ---------------------------------------------------------------------------
-# Warmup: train classifier head with early stopping
+# Warmup: train classifier head
 # ---------------------------------------------------------------------------
 
 def warmup_head(model, train_loader, args, criterion):
     """Train classifier[6] only, for exactly warmup_epochs on the (biased) train set.
 
-    No early stopping: the test set is reserved for pure evaluation only.
+    No early stopping: the evaluation sets are reserved for evaluation only.
     The augmented path is bypassed during warmup so the head learns from
-    raw conv features, consistent with run_PFT.py.
+    raw conv features.
     """
     for p in model.parameters():
         p.requires_grad = False
@@ -658,13 +667,13 @@ def run_one(args):
 
     # Natural watermark test set (replaces synthetic eval when --natural_test is set)
     natural_test_samples = None
-    if getattr(args, 'natural_test', False):
-        if not getattr(args, 'test_indices_path', None):
+    if args.natural_test:
+        if not args.test_indices_path:
             raise ValueError('--natural_test requires --test_indices_path')
         natural_test_samples = build_natural_test_samples(
             cfg['pos_dir'], cfg['neg_dir'],
             args.test_indices_path,
-            n_test=getattr(args, 'n_natural_test', 400),
+            n_test=args.n_natural_test,
         )
 
     # Model
@@ -677,8 +686,7 @@ def run_one(args):
     # the projection used to evaluate subspace activity.
     U_orig = None
     if natural_test_samples is not None:
-        U_orig = torch.load(cfg['u_path'], map_location='cpu',
-                            weights_only=False).float()
+        U_orig = load_u_matrix(cfg['u_path'])
 
     # Tuner (calls setup_dataloaders internally)
     tuner = WatermarkPruningFineTuner(
@@ -691,7 +699,6 @@ def run_one(args):
     )
 
     # Warmup: train classifier head on the biased training set only.
-    # Test loader is reserved for pure evaluation — not used here.
     print("=== Warmup ===")
     criterion = nn.CrossEntropyLoss()
     warmup_head(model, tuner.train_loader, args, criterion)
@@ -709,19 +716,35 @@ def run_one(args):
         iter_finetune_epochs=args.iter_finetune_epochs,
     )
 
-    # Save stats (no model weights)
     out_dir = Path(args.out_dir) / args.experiment / args.pruner / f'seed{args.seed}'
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / 'stats.pt'
 
+    if args.save_model:
+        # Virtual layer was removed before final fine-tuning, so both pruners save a plain VGG16.
+        model_path = out_dir / f'{args.pruner}.pt'
+        save_pruned_checkpoint(model_path, tuner.model, meta={
+            'experiment': args.experiment,
+            'pruner': args.pruner,
+            'seed': args.seed,
+            'spurious_subspace': list(args.spurious_subspace),
+            'subspace_dims': list(args.subspace_dims),
+            'pr_step': args.pr_step,
+            'total_pr': args.total_pr,
+            'eval_on_test': args.eval_on_test,
+        })
+        print(f"[saved] {model_path}")
+
+    out_path = out_dir / 'stats.pt'
     torch.save({
         'experiment':            args.experiment,
         'pruner':                args.pruner,
         'seed':                  args.seed,
         'spurious_subspace':     args.spurious_subspace,
+        'subspace_dims':         list(args.subspace_dims),
         'iter_finetune_epochs':  args.iter_finetune_epochs,
         'rank_loader_type':      args.rank_loader_type,
         'eval_on_test':          args.eval_on_test,
+        'natural_test':          args.natural_test,
         'n_val':                 N_VAL,
         'n_train_pos':           N_TRAIN_POS,
         'n_train_neg':           N_TRAIN_NEG,
@@ -729,7 +752,7 @@ def run_one(args):
         'n_rank_neg':            N_RANK_NEG,
         'train_loss':            tuner.train_loss_tot,
         'train_acc':             tuner.train_acc_tot,
-        # eval_* keys reflect the loader used: val (sweep) or test (--eval_on_test).
+        # eval_* keys reflect the loader used: val (default) or test (--eval_on_test).
         'eval_loss':             tuner.test_loss_tot,
         'eval_acc':              tuner.test_acc_tot,
         'eval_iter':             tuner.test_iter,
@@ -740,7 +763,7 @@ def run_one(args):
         # where g=0 → no-watermark, g=1 → watermark; y=0 → neg, y=1 → pos
         # Subgroup labels: c0w0=(g0y0), c1w0=(g0y1), c0w1=(g1y0), c1w1=(g1y1)
         'eval_subgroup_stats':   tuner.subgroup_stats_tot,
-        # Per-iteration subspace LRP relevance (NCP only, natural test set).
+        # Per-iteration subspace LRP relevance (CNP only, natural test set).
         # Each entry: {niter, mean_all (K,), mean_wm0 (K,), mean_wm1 (K,)}
         'subspace_relevance':    tuner.subspace_relevance_tot,
     }, out_path)
@@ -753,19 +776,21 @@ def run_one(args):
 
 def get_args():
     p = argparse.ArgumentParser(
-        description='NCP vs. vanilla pruning on synthetic watermark spurious-cue task.')
+        description='CNP vs. vanilla LRP pruning on the synthetic watermark spurious-cue task.')
 
     p.add_argument('--experiment', choices=['carton', 'crate'], required=True,
                    help='Which binary classification task to run.')
-    p.add_argument('--pruner', choices=['ncp', 'vanilla'], required=True)
+    p.add_argument('--pruner', choices=['ncp', 'vanilla'], required=True,
+                   help="'ncp' = CNP (concept ablation + LRP pruning); 'vanilla' = LRP pruning only.")
     p.add_argument('--seed', type=int, default=0)
 
-    # Subspace to ablate (NCP only).  Identify by inspecting DRSA subspace heatmaps.
+    # Subspace to ablate (CNP only).  Identify by inspecting DRSA subspace heatmaps.
     p.add_argument('--spurious_subspace', type=int, nargs='+', default=[0],
-                   help='One or more 0-indexed DRSA subspaces to ablate (NCP only). '
-                        'E.g. --spurious_subspace 1 3 ablates both subspaces 1 and 3.')
+                   help='One or more 0-indexed DRSA subspaces to ablate (CNP only). '
+                        'The paper numbers subspaces from 1: carton "subspace 4" = 3, '
+                        'crate "subspace 2" = 1.')
 
-    # Pruning hyperparameters (same defaults as run_PFT.py)
+    # Pruning hyperparameters
     p.add_argument('--pr_step',   type=float, default=0.05,
                    help='Fraction of filters pruned per iteration.')
     p.add_argument('--total_pr',  type=float, default=0.80,
@@ -781,12 +806,11 @@ def get_args():
                    help='Fine-tuning epochs after each pruning iteration.')
     p.add_argument('--rank_loader_type', choices=['positive_only', 'full_loader'],
                    default='positive_only',
-                   help='positive_only: 500 pos images for LRP scoring. '
+                   help='positive_only: 500 pos images for LRP scoring (paper). '
                         'full_loader: 250 pos + 250 neg (same total).')
     p.add_argument('--eval_on_test', action='store_true', default=False,
-                   help='Evaluate on the held-out test set instead of val. '
-                        'Use only for final paper runs after hyperparameter selection; '
-                        'do NOT set during hyperparameter sweeps.')
+                   help='Evaluate on the held-out test split instead of val. '
+                        'Applies to every evaluation (baseline, each iteration, final).')
     p.add_argument('--natural_test', action='store_true', default=False,
                    help='Replace the synthetic-watermark eval set with a natural-watermark '
                         'test set (carton only). Requires --test_indices_path.')
@@ -810,23 +834,26 @@ def get_args():
     p.add_argument('--fine_tune_with_augmented_layers',
                    dest='fine_tune_without_augmented_layers', action='store_false')
 
-    # NCP subspace dims
+    # CNP subspace dims
     p.add_argument('--subspace_dims', type=int, nargs='+', default=SUBSPACE_DIMS)
 
-    # CUDA
-    p.add_argument('--cuda',    action='store_true',  default=True)
-    p.add_argument('--no_cuda', dest='cuda', action='store_false')
+    # Device
+    p.add_argument('--no_cuda', dest='cuda', action='store_false',
+                   help='Run on CPU even if CUDA is available.')
 
     # Required by PruningFineTuner internals
     p.add_argument('--relevance',    action='store_true', default=True)
     p.add_argument('--no_relevance', dest='relevance', action='store_false')
     p.add_argument('--method_type',  type=str, default='lrp')
-    p.add_argument('--min_male_with_attr', type=int, default=0)
 
+    # Outputs
     p.add_argument('--out_dir', type=str,
-                   default='/n/fs/ncp/NCP.v2/results/watermark_experiment/')
+                   default=str(RESULTS_ROOT / 'watermark_experiment'))
+    p.add_argument('--save_model', action='store_true', default=False,
+                   help='Also save the final pruned model ({pruner}.pt, state_dict + channel counts).')
 
     args = p.parse_args()
+    args.cuda = args.cuda and torch.cuda.is_available()
 
     # Required by PruningFineTuner.test() for subgroup stats
     args.data_type = 'watermark_imagenet'
@@ -841,5 +868,6 @@ def get_args():
 if __name__ == '__main__':
     args = get_args()
     print(f"[config] experiment={args.experiment}  pruner={args.pruner}  "
-          f"seed={args.seed}  spurious_subspace={args.spurious_subspace}")
+          f"seed={args.seed}  spurious_subspace={args.spurious_subspace}  "
+          f"eval_on_test={args.eval_on_test}  cuda={args.cuda}")
     run_one(args)

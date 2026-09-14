@@ -1,11 +1,11 @@
 """
 run_PFT_basketball.py
 
-Basketball-specific NCP pruning script. Differs from run_PFT.py in two ways:
+Basketball CNP pruning script (paper Section 4.2.1). "ncp" is the CLI/file identifier for
+CNP (the method's earlier name): --pruner ncp.
 
-1. Warmup — trains the 2-d classifier head on the full basketball dataset for up
-   to 15 epochs, stopping early once validation loss stops improving (patience=3,
-   min_delta=1e-3).
+1. Warmup — trains the 2-d classifier head on the basketball dataset for up to 15 epochs,
+   stopping early once held-out loss stops improving (patience=3, min_delta=1e-3).
 
 2. Positive-class-only LRP ranking — at each pruning iteration the LRP relevance
    pass runs over only the first 500 basketball-class images (sorted by filename),
@@ -13,81 +13,36 @@ Basketball-specific NCP pruning script. Differs from run_PFT.py in two ways:
    detecting basketball. Fine-tuning after each prune step still uses the full
    (both-class) training set so the model can recover on all examples.
 
+Subspace indices are 0-indexed; the paper's "subspace 4" (the ball) is --irrelevant_subspaces 3.
+
+Outputs (in --out_dir)
+----------------------
+  stats.pt                      per-iteration loss/accuracy statistics and final channel counts
+  ncp-2.pth / van.pth           final pruned model (ncp.checkpoint format), unless --stats_only
+
 Usage
 -----
-python run_PFT_basketball.py \\
-    --pruner ncp \\
-    --u_filepath /n/fs/ncp/NCP.v2/data/projection_matrices/U_basketball_tensor.pt \\
-    --irrelevant_subspaces 1 \\
-    --out_dir /n/fs/ncp/NCP.v2/results/basketball-ncp/irrelevant_subspace_1
+python experiments/run_PFT_basketball.py --pruner ncp --irrelevant_subspaces 3 \\
+    --out_dir results/basketball/ncp_ss3
+python experiments/run_PFT_basketball.py --pruner vanilla --out_dir results/basketball/vanilla
+(see scripts/reproduce_basketball.sh)
 """
 
 import argparse
 import glob
-import os
+from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import models, datasets, transforms
 from torch.utils.data import DataLoader, Subset
-from torch.autograd import Variable
-from pathlib import Path
 
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16
-from prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
-from lrp import lrp
-
-
-# ---------------------------------------------------------------------------
-# Helpers (copied from run_PFT.py to avoid its module-level CUDA side-effects)
-# ---------------------------------------------------------------------------
-
-def _load_u_matrix(path: str) -> torch.Tensor:
-    if path.endswith('.npy'):
-        arr = np.load(path)
-        if arr.ndim == 3:
-            d, n_sub, sub_dim = arr.shape
-            print(f"[U matrix] 3-D array {arr.shape} → reshaping to ({d}, {n_sub * sub_dim})")
-            arr = arr.reshape(d, n_sub * sub_dim)
-        return torch.tensor(arr, dtype=torch.float32)
-    else:
-        U = torch.load(path, map_location='cpu')
-        if not isinstance(U, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor from {path!r}, got {type(U)}")
-        return U.float()
-
-
-def _load_checkpoint_state_dict(path: str) -> dict:
-    ckpt = torch.load(path, map_location='cpu')
-    if isinstance(ckpt, dict):
-        if 'state_dict' in ckpt:
-            return ckpt['state_dict']
-        if 'model' in ckpt:
-            obj = ckpt['model']
-            return obj.state_dict() if hasattr(obj, 'state_dict') else obj
-        return ckpt
-    if hasattr(ckpt, 'state_dict'):
-        return ckpt.state_dict()
-    raise ValueError(f"Cannot extract state_dict from checkpoint at {path!r}")
-
-
-def _remap_vgg16_features_to_augmented(state_dict: dict) -> dict:
-    new_sd = {}
-    for k, v in state_dict.items():
-        if k.startswith('features.'):
-            parts = k.split('.')
-            layer_idx = int(parts[1])
-            suffix = '.'.join(parts[2:])
-            if layer_idx < 23:
-                new_sd[f'before.{layer_idx}.{suffix}'] = v
-            else:
-                new_sd[f'after.{layer_idx - 23}.{suffix}'] = v
-        else:
-            new_sd[k] = v
-    return new_sd
+from ncp.AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16, load_u_matrix
+from ncp.checkpoint import (extract_channels, load_pruned_checkpoint, load_state_dict_from_file,
+                            save_pruned_checkpoint, vgg16_to_augmented_state_dict)
+from ncp.lrp import lrp
+from ncp.paths import IMAGES_DIR, PROJECTION_DIR, RESULTS_ROOT
+from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +93,6 @@ def build_basketball_rank_loader(root_dir: str, transform, n: int = 500,
 
 
 # ---------------------------------------------------------------------------
-# PruningFineTuner subclass: swap train_loader during ranking only
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Inline LRP + heatmap helpers (cached-static columns pre-computed once)
 # ---------------------------------------------------------------------------
 
@@ -159,7 +110,8 @@ def _run_lrp(modules_bwd, first_conv, R):
     return R
 
 
-def _lrp_vanilla_vgg16(model, x, target_cls):
+def _lrp_vgg16(model, x, target_cls):
+    """LRP-α1β0 heatmap for a torchvision-layout VGG16 (ImageNet or pruned)."""
     feats = list(model.features)
     clf   = list(model.classifier)
     handles = [m.register_forward_hook(_fhook) for m in feats + clf]
@@ -172,20 +124,8 @@ def _lrp_vanilla_vgg16(model, x, target_cls):
     return R.squeeze(0).cpu().numpy()
 
 
-def _lrp_pruned_vanilla(model, x, target_cls):
-    feats = list(model.features)
-    clf   = list(model.classifier)
-    handles = [m.register_forward_hook(_fhook) for m in feats + clf]
-    model.eval()
-    with torch.no_grad():
-        out = model(x.unsqueeze(0))
-    R = torch.zeros_like(out); R[0, target_cls] = 1.0
-    R = _run_lrp(list(reversed(clf)) + list(reversed(feats)), feats[0], R)
-    for h in handles: h.remove()
-    return R.squeeze(0).cpu().numpy()
-
-
-def _lrp_pruned_ncp(model, x, target_cls):
+def _lrp_pruned_augmented(model, x, target_cls):
+    """LRP-α1β0 heatmap for the in-training AugmentedVGG16 (virtual layer bypassed)."""
     before = list(model.before)
     after  = list(model.after)
     clf    = list(model.classifier)
@@ -252,11 +192,11 @@ def precompute_static_heatmaps(img_paths, vanilla_imagenet, vanilla_pruned, devi
         pil_images.append(img_cropped)
         x = tt(img_cropped).to(device)
 
-        hm_im = _lrp_vanilla_vgg16(vanilla_imagenet, x, 430).sum(axis=0)
+        hm_im = _lrp_vgg16(vanilla_imagenet, x, 430).sum(axis=0)
         van_im_logits.append(float(vanilla_imagenet(x.unsqueeze(0)).squeeze()[430]))
         van_im_hms.append(hm_im)
 
-        hm_pr = _lrp_pruned_vanilla(vanilla_pruned, x, 0).sum(axis=0)
+        hm_pr = _lrp_vgg16(vanilla_pruned, x, 0).sum(axis=0)
         van_pr_logits.append(float(vanilla_pruned(x.unsqueeze(0)).squeeze()[0]))
         van_pr_hms.append(hm_pr)
 
@@ -264,11 +204,10 @@ def precompute_static_heatmaps(img_paths, vanilla_imagenet, vanilla_pruned, devi
     return pil_images, van_im_hms, van_im_logits, van_pr_hms, van_pr_logits
 
 
-def generate_heatmap(ncp_model, device, img_paths, pil_images,
+def generate_heatmap(cnp_model, device, img_paths, pil_images,
                      van_im_hms, van_im_logits, van_pr_hms, van_pr_logits,
-                     out_path, niter):
-    """Generate 4-column LRP comparison figure for the current NCP model state."""
-    import glob as _glob
+                     out_path, niter, ablated=()):
+    """Generate 4-column LRP comparison figure for the current CNP model state."""
     import torchvision.transforms as _T
     import matplotlib
     matplotlib.use('Agg')
@@ -281,10 +220,11 @@ def generate_heatmap(ncp_model, device, img_paths, pil_images,
     ])
     rc = _T.Compose([_T.Resize(256), _T.CenterCrop(224)])
 
+    ablated_label = "+".join(str(s) for s in ablated) or "none"
     col_titles = [
         "Image",
         "VGG16 ImageNet\nLRP (logit 430)",
-        f"NCP pruned (ss0+1+2 ablated)\nLRP (basketball logit)  iter={niter}",
+        f"CNP pruned (ss {ablated_label} ablated)\nLRP (basketball logit)  iter={niter}",
         "Vanilla pruned\nLRP (basketball logit)",
     ]
 
@@ -296,17 +236,17 @@ def generate_heatmap(ncp_model, device, img_paths, pil_images,
             zip(img_paths, pil_images, van_im_hms, van_im_logits, van_pr_hms, van_pr_logits)):
         img_orig = _Image.open(p).convert('RGB')
         x = tt(rc(img_orig)).to(device)
-        hm_ncp = _lrp_pruned_ncp(ncp_model, x, 0).sum(axis=0)
-        logit_ncp = float(ncp_model(x.unsqueeze(0)).squeeze()[0])
+        hm_cnp = _lrp_pruned_augmented(cnp_model, x, 0).sum(axis=0)
+        logit_cnp = float(cnp_model(x.unsqueeze(0)).squeeze()[0])
 
         title_row = col_titles if row == 0 else [None]*4
         _show_image(axes[row][0], img_orig, ylabel=f"img-{row}", title=title_row[0])
         _show_heatmap(axes[row][1], hm_im,  logit=logit_im,  title=title_row[1])
-        _show_heatmap(axes[row][2], hm_ncp, logit=logit_ncp, title=title_row[2])
+        _show_heatmap(axes[row][2], hm_cnp, logit=logit_cnp, title=title_row[2])
         _show_heatmap(axes[row][3], hm_pr,  logit=logit_pr,  title=title_row[3])
 
     fig.suptitle(
-        f"LRP-α1β0: VGG16 ImageNet vs NCP (ss0+1+2 ablated, iter {niter}) vs Vanilla pruned",
+        f"LRP-α1β0: VGG16 ImageNet vs CNP (ss {ablated_label} ablated, iter {niter}) vs Vanilla pruned",
         fontsize=10,
     )
     _plt.tight_layout()
@@ -316,7 +256,7 @@ def generate_heatmap(ncp_model, device, img_paths, pil_images,
 
 
 # ---------------------------------------------------------------------------
-# Heatmap-generating subclass
+# PruningFineTuner subclasses
 # ---------------------------------------------------------------------------
 
 class BasketballPruningFineTuner(PruningFineTuner):
@@ -351,7 +291,7 @@ class BasketballPruningFineTuner(PruningFineTuner):
 
 
 class HeatmapBasketballPruningFineTuner(BasketballPruningFineTuner):
-    """Generates a per-iteration LRP comparison heatmap after every test() call."""
+    """Generates a per-iteration LRP comparison heatmap after every test() call (CNP runs only)."""
 
     def set_heatmap_params(self, img_paths, pil_images,
                            van_im_hms, van_im_logits,
@@ -373,7 +313,7 @@ class HeatmapBasketballPruningFineTuner(BasketballPruningFineTuner):
             return
         out_path = self._hm_out_dir / f'lrp_iter{self.niter:03d}.png'
         generate_heatmap(
-            ncp_model=self.model,
+            cnp_model=self.model,
             device=self._hm_device,
             img_paths=self._hm_img_paths,
             pil_images=self._hm_pil_images,
@@ -383,6 +323,7 @@ class HeatmapBasketballPruningFineTuner(BasketballPruningFineTuner):
             van_pr_logits=self._hm_van_pr_logits,
             out_path=out_path,
             niter=self.niter,
+            ablated=self.args.irrelevant_subspaces,
         )
 
 
@@ -392,14 +333,14 @@ class HeatmapBasketballPruningFineTuner(BasketballPruningFineTuner):
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description='Basketball NCP pruning with positive-class LRP ranking.')
+        description='Basketball CNP pruning with positive-class LRP ranking.')
     parser.add_argument('--train_batch_size', type=int, default=32)
     parser.add_argument('--test_batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--cuda', action='store_true', default=True)
-    parser.add_argument('--no_cuda', dest='cuda', action='store_false')
+    parser.add_argument('--no_cuda', dest='cuda', action='store_false',
+                        help='Run on CPU even if CUDA is available.')
 
     # pruning config
     parser.add_argument('--relevance', action='store_true', default=True)
@@ -417,14 +358,17 @@ def get_args():
     parser.add_argument('--warmup_epochs', type=int, default=15,
                         help='Max epochs for warmup head training.')
     parser.add_argument('--warmup_patience', type=int, default=3,
-                        help='Early-stop patience (epochs without val-loss improvement).')
+                        help='Early-stop patience (epochs without held-out loss improvement).')
     parser.add_argument('--warmup_min_delta', type=float, default=1e-3,
-                        help='Minimum val-loss improvement to reset patience counter.')
+                        help='Minimum held-out loss improvement to reset patience counter.')
 
     # model / experiment config
-    parser.add_argument('--pruner', type=str, choices=['ncp', 'vanilla'], default='ncp')
+    parser.add_argument('--pruner', type=str, choices=['ncp', 'vanilla'], default='ncp',
+                        help="'ncp' = CNP (concept ablation + LRP pruning); 'vanilla' = LRP pruning only.")
     parser.add_argument('--data_type', type=str, default='basketball_imagenet')
-    parser.add_argument('--pretrained_model_path', type=str, default=None)
+    parser.add_argument('--pretrained_model_path', type=str, default=None,
+                        help='Optional fine-tuned (unpruned) VGG16 checkpoint to start from '
+                             'instead of ImageNet weights.')
     parser.add_argument('--fine_tune_conv_layers', action='store_true', default=True)
     parser.add_argument('--no_fine_tune_conv_layers', dest='fine_tune_conv_layers',
                         action='store_false')
@@ -433,44 +377,48 @@ def get_args():
     parser.add_argument('--fine_tune_with_augmented_layers',
                         dest='fine_tune_without_augmented_layers', action='store_false')
     parser.add_argument('--subspace_dims', type=int, nargs='+', default=[128, 128, 128, 128])
-    parser.add_argument('--irrelevant_subspaces', type=int, nargs='+', default=[])
+    parser.add_argument('--irrelevant_subspaces', type=int, nargs='+', default=[],
+                        help='0-indexed DRSA subspaces to ablate (CNP only). '
+                             'The paper ablates "subspace 4" (the ball) = 3.')
     parser.add_argument('--u_filepath', type=str,
-                        default='/n/fs/ncp/NCP.v2/data/projection_matrices/U_basketball_tensor.pt')
+                        default=str(PROJECTION_DIR / 'U_basketball_tensor.pt'))
     parser.add_argument('--basketball_root', type=str,
-                        default='/n/fs/ncp/NCP.v2/data/images/imagenet_430_binary',
+                        default=str(IMAGES_DIR / 'imagenet_430_binary'),
                         help='Root dir for the basketball ImageFolder dataset.')
     parser.add_argument('--out_dir', type=str,
-                        default='/n/fs/ncp/NCP.v2/results/basketball-ncp/')
+                        default=str(RESULTS_ROOT / 'basketball'))
     parser.add_argument('--final_finetune_epochs', type=int, default=5)
     parser.add_argument('--iter_finetune_epochs', type=int, default=2,
                         help='Fine-tuning epochs after each pruning iteration.')
-    parser.add_argument('--stats_only', action='store_true', default=False)
+    parser.add_argument('--stats_only', action='store_true', default=False,
+                        help='Save stats.pt only (skip the pruned model checkpoint).')
 
     # Per-iteration LRP heatmap generation
     parser.add_argument('--iter_heatmap_dir', type=str, default=None,
-                        help='If set, generate an LRP comparison heatmap after every '
+                        help='If set (CNP only), generate an LRP comparison heatmap after every '
                              'test() call and save to this directory. '
                              'Vanilla-imagenet and vanilla-pruned columns are cached once.')
     parser.add_argument('--vanilla_pruned_path', type=str, default=None,
-                        help='Path to vanilla-pruned .pth checkpoint (for heatmap col 3). '
+                        help='Path to the vanilla-pruned checkpoint (van.pth) for heatmap col 3. '
                              'Required when --iter_heatmap_dir is set.')
     parser.add_argument('--heatmap_img_dir', type=str,
-                        default='/n/fs/ncp/NCP.v2/data/images/drsa_basketball_test_images',
+                        default=str(IMAGES_DIR / 'drsa_basketball_test_images'),
                         help='Directory of test images to use for LRP heatmaps.')
 
     args = parser.parse_args()
+    args.cuda = args.cuda and torch.cuda.is_available()
     return args
 
 
 # ---------------------------------------------------------------------------
-# Warmup: train classifier head with early stopping on val loss
+# Warmup: train classifier head with early stopping on held-out loss
 # ---------------------------------------------------------------------------
 
 def warmup_head(model, train_loader, val_loader, args, criterion):
     """Train classifier[6] only, for up to warmup_epochs with patience-based early stop.
 
     Bypasses the augmented path during warmup (raw conv features → head) so the
-    head learns from the pre-ablation representation, consistent with run_PFT.py.
+    head learns from the pre-ablation representation.
     """
     for param in model.parameters():
         param.requires_grad = False
@@ -504,7 +452,7 @@ def warmup_head(model, train_loader, val_loader, args, criterion):
 
         avg_train_loss = running_loss / len(train_loader)
 
-        # Validation loss for early stopping
+        # Held-out loss for early stopping
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -561,20 +509,21 @@ def main():
     # ------------------------------------------------------------------
     # Build model
     # ------------------------------------------------------------------
+    start_weights = None if args.pretrained_model_path else models.VGG16_Weights.IMAGENET1K_V1
     if args.pruner == 'ncp':
-        U = _load_u_matrix(args.u_filepath)
+        U = load_u_matrix(args.u_filepath)
         U_ab, U_ab_T = ablate_subspace_matrix(U, args.subspace_dims, args.irrelevant_subspaces)
-        model = AugmentedVGG16(U_ab, U_ab_T)
+        model = AugmentedVGG16(U_ab, U_ab_T, weights=start_weights)
     else:
-        model = models.vgg16(pretrained=(args.pretrained_model_path is None))
+        model = models.vgg16(weights=start_weights)
 
     model.classifier[6] = nn.Linear(4096, 2)
 
     if args.pretrained_model_path:
         print(f"Loading pretrained weights from: {args.pretrained_model_path}")
-        sd = _load_checkpoint_state_dict(args.pretrained_model_path)
+        sd = load_state_dict_from_file(args.pretrained_model_path)
         if args.pruner == 'ncp':
-            sd = _remap_vgg16_features_to_augmented(sd)
+            sd = vgg16_to_augmented_state_dict(sd)
             missing, unexpected = model.load_state_dict(sd, strict=False)
             for param in model.encode.parameters():
                 param.requires_grad = False
@@ -605,6 +554,8 @@ def main():
     # ------------------------------------------------------------------
     _heatmap_ready = False
     if args.iter_heatmap_dir:
+        if args.pruner != 'ncp':
+            raise ValueError("--iter_heatmap_dir is only supported with --pruner ncp")
         if not args.vanilla_pruned_path:
             raise ValueError("--vanilla_pruned_path is required when --iter_heatmap_dir is set")
         device_str = 'cuda' if args.cuda else 'cpu'
@@ -616,8 +567,8 @@ def main():
             p.requires_grad_(False)
 
         print(f"[heatmap] loading vanilla pruned model from {args.vanilla_pruned_path}")
-        van_ckpt = torch.load(args.vanilla_pruned_path, map_location='cpu', weights_only=False)
-        vanilla_pruned = van_ckpt['model'].to(device_str).eval()
+        vanilla_pruned, _ = load_pruned_checkpoint(args.vanilla_pruned_path)
+        vanilla_pruned = vanilla_pruned.to(device_str).eval()
         for p in vanilla_pruned.parameters():
             p.requires_grad_(False)
 
@@ -660,15 +611,6 @@ def main():
     )
     tuner.set_rank_loader(rank_loader)
 
-    # Persist eval supplement log (always empty for basketball, but kept for
-    # consistency with run_PFT.py so downstream tooling can read the same file)
-    os.makedirs(args.out_dir, exist_ok=True)
-    supplement_log_path = os.path.join(args.out_dir, 'eval_supplement_fnames.txt')
-    with open(supplement_log_path, 'w') as _f:
-        _f.write("# Filenames pulled from official TEST split to supplement eval set\n")
-        _f.write(f"# min_male_with_attr=0  count=0\n")
-        _f.write("# (not applicable for basketball_imagenet)\n")
-
     # ------------------------------------------------------------------
     # Warmup: train 2-d head on full training set (both classes)
     # ------------------------------------------------------------------
@@ -694,18 +636,15 @@ def main():
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
-    pruned_structure = [
-        m.out_channels
-        for layer_idx, m in enumerate(adapter.iter_modules_forward_order())
-        if isinstance(m, nn.Conv2d) and adapter.is_prunable_conv(m, layer_idx)
-    ]
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_path = os.path.join(
-        args.out_dir,
-        'ncp-2.pth' if args.pruner == 'ncp' else 'van.pth',
-    )
-    save_dict = {
-        'pruned_structure': pruned_structure,
+    channels = extract_channels(tuner.model)
+    stats_path = out_dir / 'stats.pt'
+    torch.save({
+        'pruner': args.pruner,
+        'seed': args.seed,
+        'channels': channels,
         'train_loss': tuner.train_loss_tot,
         'train_acc': tuner.train_acc_tot,
         'test_loss': tuner.test_loss_tot,
@@ -713,15 +652,23 @@ def main():
         'test_iter': tuner.test_iter,
         'test_precision_per_class': tuner.test_precision_tot,
         'test_recall_per_class': tuner.test_recall_tot,
-        'subgroup_stats': tuner.subgroup_stats_tot,
         'irrelevant_subspaces': args.irrelevant_subspaces,
         'rank_n_images': args.rank_n_images,
-    }
+    }, stats_path)
+    print(f"Saved stats to {stats_path}")
+
     if not args.stats_only:
-        save_dict['model'] = tuner.model
-        save_dict['state_dict'] = tuner.model.state_dict()
-    torch.save(save_dict, out_path)
-    print(f"Saved to {out_path}")
+        model_path = out_dir / ('ncp-2.pth' if args.pruner == 'ncp' else 'van.pth')
+        save_pruned_checkpoint(model_path, tuner.model, meta={
+            'experiment': 'basketball',
+            'pruner': args.pruner,
+            'seed': args.seed,
+            'irrelevant_subspaces': list(args.irrelevant_subspaces),
+            'subspace_dims': list(args.subspace_dims),
+            'pr_step': args.pr_step,
+            'total_pr': args.total_pr,
+        })
+        print(f"Saved model to {model_path}")
 
 
 if __name__ == '__main__':

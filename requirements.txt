@@ -1,24 +1,23 @@
-# Core deep learning
-# Install PyTorch with the appropriate CUDA version for your system:
+# Install PyTorch for your platform first, e.g. (CUDA 11.8):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-# Versions used during development (CUDA 11.8):
+# then install this repo (pulls in the core dependencies from pyproject.toml):
+#   pip install -e ".[dev,data]"
+#
+# This file lists the same dependencies for environments that don't use `pip install -e .`.
+
+# Core
 torch>=2.4.0
 torchvision>=0.19.0
-
-# Data / numerics
 numpy>=1.23
-pandas>=1.5
-
-# Visualization
-matplotlib>=3.6
-imageio>=2.28
-Pillow>=10.0
-
-# ML utilities
 scikit-learn>=1.3
-tqdm>=4.64
+Pillow>=10.0
+matplotlib>=3.6
 
-# Data downloading (data/images/download*.py)
-requests>=2.28
+# Data download (data/images/download_*.py)
 certifi>=2023.0
 
+# Tests
+pytest>=7
+
+# Figures 2 and 5 (analysis/carton_crate_lrp_subspaces.py) additionally need the
+# `cxai` package from https://github.com/p16i/drsa-demo (see README, "Figures").

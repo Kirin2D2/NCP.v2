@@ -2,8 +2,15 @@
 """
 plot_watermark_results.py
 
-Plots NCP vs vanilla pruning results for the watermark spurious-cue experiment.
-Produces four figures per experiment (carton / crate):
+Plots CNP vs vanilla LRP pruning results for the watermark spurious-cue experiment
+(paper Figures 3-4). Results for CNP are read from the `ncp/` directories ("ncp" is the
+CLI/file identifier for CNP).
+
+Paper figures:
+  top    (overall accuracy):  {experiment}_accuracy.png        (--no_titles)
+  bottom (c0w1 OOD accuracy): {experiment}_c0w1_combined.png   (--c0w1_only --no_titles)
+
+By default, produces four figures per experiment (carton / crate):
 
   {experiment}_accuracy.png        — overall test accuracy vs pruning iteration
   {experiment}_subgroup_acc.png    — per-subgroup accuracy (c1w0, c1w1, c0w0, c0w1)
@@ -20,10 +27,10 @@ Subgroup key:
 
 Usage:
     python plot_watermark_results.py \\
-        --results_dir /n/fs/ncp/NCP.v2/results/watermark_experiment/ \\
+        --results_dir results/watermark_experiment/ \\
         --experiments carton crate \\
         --seeds 0 1 2 3 4 \\
-        --out_dir /n/fs/ncp/NCP.v2/results/watermark_experiment/plots/
+        --out_dir results/watermark_experiment/plots/
 """
 
 import argparse
@@ -69,7 +76,7 @@ FS_LEGEND = 11   # legend text
 
 
 # ---------------------------------------------------------------------------
-# Data helpers  (same logic as plot_results.py)
+# Data helpers
 # ---------------------------------------------------------------------------
 
 def _load(path):
@@ -194,7 +201,7 @@ def plot_accuracy(experiment, ncp_ds, van_ds, n_seeds, out_path, no_titles=False
 
 def plot_subgroup_accuracy(experiment, ncp_ds, van_ds, n_seeds, out_path):
     """
-    4-subgroup accuracy panel: two columns (NCP | Vanilla), four lines each.
+    4-subgroup accuracy panel: two columns (CNP | Vanilla), four lines each.
     Key subgroups:
       c1w0 (acc_g0y1) — positive, no watermark  (tests model without spurious cue)
       c0w1 (acc_g1y0) — negative, watermarked   (tests false-positive from spurious cue)
@@ -275,11 +282,11 @@ def _plot_2panel(experiment, ncp_ds, van_ds, n_seeds, key_base,
 
 
 # ---------------------------------------------------------------------------
-# c0w1-only combined figure (NCP + Vanilla in one panel)
+# c0w1-only combined figure (CNP + Vanilla in one panel)
 # ---------------------------------------------------------------------------
 
 def plot_c0w1_combined(experiment, ncp_ds, van_ds, n_seeds, out_path, no_titles=False):
-    """Single panel: c0w1 (neg, WM) accuracy for NCP and Vanilla on the same axes."""
+    """Single panel: c0w1 (neg, WM) accuracy for CNP and Vanilla on the same axes."""
     fig, ax = plt.subplots(figsize=(8, 4))
 
     for label, color, ds in [('CNP', 'steelblue', ncp_ds),

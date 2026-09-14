@@ -1,0 +1,10 @@
+# Normalize text files; keep LF in shell/SLURM scripts so they run under bash on any OS.
+* text=auto
+*.sh    text eol=lf
+*.slurm text eol=lf
+
+*.pt   binary
+*.pth  binary
+*.otf  binary
+*.pdf  binary
+*.jpg  binary

@@ -2,24 +2,30 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
 
-# Slurm job logs
+# Jupyter
+.ipynb_checkpoints/
+
+# Job logs
 logs/
 
-# Large outputs, trained models, generated figures
+# Experiment outputs, trained/pruned models, generated figures
+# (paper checkpoints and stats.pt are distributed as release assets; see README)
 results/
-results-public/
+checkpoints/
+*.pth
 
-# Large image datasets (regenerate via data/images/download*.py)
-data/images/imagenet_430_binary/
+# ImageNet images (download with data/images/download_binary_dataset.py)
 data/images/carton_dugong/original/
-data/images/crate_packet/imagenet_*/
-data/images/data_large/
-data/images/celeba/img_align_celeba.zip
+data/images/crate_packet/original/
+data/images/imagenet_430_binary/
 
 # Editor temps
 *~
 \#*\#
-
-# Tests (generated outputs)
-tests/
+.DS_Store
