@@ -149,7 +149,7 @@ tests/              CPU unit tests (ablation, checkpoint round-trip)
 @inproceedings{danek2026cnp,
   title     = {Concept-Aware Pruning via Disentangled Subspaces for Robust Convolutional Networks},
   author    = {Danek, Kirin and Ramaswamy, Vikram V.},
-  booktitle = {XAI4CV Workshop at the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) (non-archival},
+  booktitle = {XAI4CV Workshop at the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) (non-archival)},
   year      = {2026}
 }
 ```
