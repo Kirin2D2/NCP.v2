@@ -2,7 +2,8 @@
 data.py
 
 Dataset constructor for the basketball CNP experiment, used by
-PruningFineTuner.setup_dataloaders() when args.data_type == 'basketball_imagenet'.
+PruningFineTuner.setup_dataloaders() when args.data_type == 'basketball_imagenet',
+and DataLoader worker settings shared by all experiments.
 
 The carton/dugong and crate/packet experiments build their own watermark datasets in
 experiments/run_watermark_pruning_experiment.py.
@@ -10,6 +11,7 @@ experiments/run_watermark_pruning_experiment.py.
 Adapted from https://github.com/seulkiyeom/LRP_pruning/blob/master/modules/data.py
 """
 
+import os
 from pathlib import Path
 
 import torch
@@ -18,6 +20,33 @@ from torchvision import datasets, transforms
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def default_num_workers(cuda: bool) -> int:
+    """DataLoader worker processes per loader: none on CPU, else CPU count - 1, capped at 3.
+
+    The pruning loop keeps several persistent loaders alive at once (train, rank, eval), so a
+    2-vCPU machine such as Colab gets 1 worker per loader instead of oversubscribing its CPUs.
+    """
+    if not cuda:
+        return 0
+    return min(3, max(1, (os.cpu_count() or 2) - 1))
+
+
+def loader_kwargs(cuda: bool, num_workers: int) -> dict:
+    """DataLoader keyword arguments for `num_workers` persistent worker processes.
+
+    Workers use the spawn start method: forked workers can deadlock once the parent process has
+    initialized CUDA. Pinned memory is used only when training on a GPU.
+    """
+    if num_workers <= 0:
+        return {}
+    return {
+        'num_workers': num_workers,
+        'pin_memory': bool(cuda),
+        'multiprocessing_context': 'spawn',
+        'persistent_workers': True,
+    }
 
 
 def get_basketball_imagenet(root_dir, transform=None, train_frac=0.8, seed=42):

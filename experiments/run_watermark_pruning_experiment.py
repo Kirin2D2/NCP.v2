@@ -62,6 +62,7 @@ from PIL import Image
 from sklearn.metrics import average_precision_score
 from ncp.AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16, load_u_matrix
 from ncp.checkpoint import save_pruned_checkpoint
+from ncp.data import default_num_workers, loader_kwargs
 from ncp.lrp import lrp as lrp_fn
 from ncp.paths import IMAGES_DIR, PROJECTION_DIR, RESULTS_ROOT
 from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
@@ -311,24 +312,23 @@ def build_natural_test_samples(pos_dir, neg_dir, test_indices_path, n_test=400,
 
 def make_loaders(train_samples, rank_pos_samples, rank_neg_samples,
                  val_samples, test_samples,
-                 add_wm, batch_size, cuda, rank_loader_type='positive_only'):
+                 add_wm, batch_size, cuda, rank_loader_type='positive_only', num_workers=None):
     """Construct train / rank / val / test DataLoaders from sample lists.
 
     rank_loader_type:
       'positive_only' — rank loader uses all rank_pos_samples (500 pos). Used in the paper.
       'full_loader'   — rank loader uses rank_pos_samples[:250] + rank_neg_samples
                         (250 pos + 250 neg = 500 total).
+    num_workers: worker processes per loader (None = ncp.data.default_num_workers).
     """
     rc = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224)])
     tt = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
-    worker_kwargs = (
-        {'num_workers': 3, 'pin_memory': True, 'multiprocessing_context': 'spawn',
-         'persistent_workers': True}
-        if cuda else {}
-    )
+    if num_workers is None:
+        num_workers = default_num_workers(cuda)
+    worker_kwargs = loader_kwargs(cuda, num_workers)
 
     if rank_loader_type == 'full_loader':
         rank_samples = rank_pos_samples[:250] + rank_neg_samples
@@ -402,6 +402,7 @@ class WatermarkPruningFineTuner(PruningFineTuner):
             batch_size=self.args.train_batch_size,
             cuda=self.args.cuda,
             rank_loader_type=getattr(self.args, 'rank_loader_type', 'positive_only'),
+            num_workers=getattr(self.args, 'num_workers', None),
         )
         self.train_loader = train_loader
         self._rank_loader = rank_loader
@@ -413,11 +414,10 @@ class WatermarkPruningFineTuner(PruningFineTuner):
                 transforms.ToTensor(),
                 transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
-            worker_kw = (
-                {'num_workers': 3, 'pin_memory': True,
-                 'multiprocessing_context': 'spawn', 'persistent_workers': True}
-                if self.args.cuda else {}
-            )
+            num_workers = getattr(self.args, 'num_workers', None)
+            if num_workers is None:
+                num_workers = default_num_workers(self.args.cuda)
+            worker_kw = loader_kwargs(self.args.cuda, num_workers)
             nat_ds = NaturalTestDataset(self._natural_test_samples, rc, tt)
             self.test_loader = DataLoader(
                 nat_ds, batch_size=self.args.test_batch_size,
@@ -744,6 +744,7 @@ def run_one(args):
         'iter_finetune_epochs':  args.iter_finetune_epochs,
         'rank_loader_type':      args.rank_loader_type,
         'eval_on_test':          args.eval_on_test,
+        'num_workers':           args.num_workers,
         'natural_test':          args.natural_test,
         'n_val':                 N_VAL,
         'n_train_pos':           N_TRAIN_POS,
@@ -840,6 +841,9 @@ def get_args():
     # Device
     p.add_argument('--no_cuda', dest='cuda', action='store_false',
                    help='Run on CPU even if CUDA is available.')
+    p.add_argument('--num_workers', type=int, default=None,
+                   help='DataLoader worker processes per loader '
+                        '(default: CPU count - 1, at most 3; 0 without a GPU).')
 
     # Required by PruningFineTuner internals
     p.add_argument('--relevance',    action='store_true', default=True)
@@ -854,6 +858,8 @@ def get_args():
 
     args = p.parse_args()
     args.cuda = args.cuda and torch.cuda.is_available()
+    if args.num_workers is None:
+        args.num_workers = default_num_workers(args.cuda)
 
     # Required by PruningFineTuner.test() for subgroup stats
     args.data_type = 'watermark_imagenet'

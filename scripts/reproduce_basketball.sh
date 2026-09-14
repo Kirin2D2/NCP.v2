@@ -10,6 +10,7 @@
 # The paper ablates "subspace 4" (1-indexed), i.e. --irrelevant_subspaces 3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PYTHONUNBUFFERED=1   # logs update live when output is redirected to a file
 
 OUT_DIR=${OUT_DIR:-results/basketball}
 EXTRA_ARGS=${EXTRA_ARGS:-}

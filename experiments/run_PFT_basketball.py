@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader, Subset
 from ncp.AugmentedVGG16 import ablate_subspace_matrix, AugmentedVGG16, load_u_matrix
 from ncp.checkpoint import (extract_channels, load_pruned_checkpoint, load_state_dict_from_file,
                             save_pruned_checkpoint, vgg16_to_augmented_state_dict)
+from ncp.data import default_num_workers, loader_kwargs
 from ncp.lrp import lrp
 from ncp.paths import IMAGES_DIR, PROJECTION_DIR, RESULTS_ROOT
 from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
@@ -51,8 +52,8 @@ from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapt
 
 def build_basketball_rank_loader(root_dir: str, transform, n: int = 500,
                                   batch_size: int = 32,
-                                  num_workers: int = 3,
-                                  pin_memory: bool = True) -> DataLoader:
+                                  num_workers: int = 0,
+                                  cuda: bool = False) -> DataLoader:
     """Return a DataLoader over the first `n` basketball-class images (by filename).
 
     Images are drawn directly from the ImageFolder root (not from the random
@@ -86,9 +87,7 @@ def build_basketball_rank_loader(root_dir: str, transform, n: int = 500,
         rank_dataset,
         batch_size=batch_size,
         shuffle=False,   # deterministic ranking
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        multiprocessing_context='spawn' if pin_memory else None,
+        **loader_kwargs(cuda, num_workers),
     )
 
 
@@ -341,6 +340,9 @@ def get_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no_cuda', dest='cuda', action='store_false',
                         help='Run on CPU even if CUDA is available.')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='DataLoader worker processes per loader '
+                             '(default: CPU count - 1, at most 3; 0 without a GPU).')
 
     # pruning config
     parser.add_argument('--relevance', action='store_true', default=True)
@@ -407,6 +409,8 @@ def get_args():
 
     args = parser.parse_args()
     args.cuda = args.cuda and torch.cuda.is_available()
+    if args.num_workers is None:
+        args.num_workers = default_num_workers(args.cuda)
     return args
 
 
@@ -606,8 +610,8 @@ def main():
         transform=imagenet_transform,
         n=args.rank_n_images,
         batch_size=args.train_batch_size,
-        num_workers=3 if args.cuda else 0,
-        pin_memory=args.cuda,
+        num_workers=args.num_workers,
+        cuda=args.cuda,
     )
     tuner.set_rank_loader(rank_loader)
 
@@ -654,6 +658,7 @@ def main():
         'test_recall_per_class': tuner.test_recall_tot,
         'irrelevant_subspaces': args.irrelevant_subspaces,
         'rank_n_images': args.rank_n_images,
+        'num_workers': args.num_workers,
     }, stats_path)
     print(f"Saved stats to {stats_path}")
 
