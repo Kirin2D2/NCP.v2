@@ -24,6 +24,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 data = ["certifi>=2023.0"]
+# experiments/compute_drsa_resnet.py (also needs the cxai package from a drsa-demo clone)
+drsa = ["zennit>=1.0", "scipy>=1.9", "tqdm>=4.50"]
 
 [project.urls]
 Repository = "https://github.com/KirinDanek/NCP.v2"

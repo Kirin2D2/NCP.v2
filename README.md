@@ -120,10 +120,46 @@ scripts/reproduce_basketball.sh   # CNP (ablate ball subspace) and vanilla to 80
 Figures 2 and 5 need the `cxai` package from [p16i/drsa-demo](https://github.com/p16i/drsa-demo), which is not
 pip-installable. Clone it and pass `--drsa_demo_dir` or add it to `PYTHONPATH`.
 
+## ResNet backbones (experimental, not in the paper)
+
+The watermark experiment also runs CNP on torchvision ResNet-18/34/50 (`--arch`).
+
+- **Virtual layer placement.** The layer is inserted after the last block of a stage (`--virtual_layer`, default `layer3`).
+  Inside a residual block, the skip connection would carry information around the layer. Between blocks, the residual
+  stream is a single tensor, so every path to the output passes through the virtual layer. After `layer3`,
+  D = 256 (ResNet-18/34) or 1024 (ResNet-50).
+- **What gets pruned.** Only channels internal to a block: `conv1` in basic blocks, `conv1`/`conv2` in bottlenecks.
+  Residual-stream channels are shared across a stage through the additions and fix D, so they stay intact.
+  This is the ResNet analogue of keeping `conv4_3` in VGG-16.
+- **LRP.** Conv+BatchNorm pairs are fused and use LRP-α1β0 (zB at the stem). Residual additions split relevance in
+  proportion to each path's positive contribution. Global average pooling redistributes relevance in
+  proportion to the activations. See `src/ncp/lrp_resnet.py`.
+- **DRSA matrix.** `experiments/compute_drsa_resnet.py` learns a D×D DRSA matrix at the chosen stage of the
+  ImageNet-pretrained ResNet. It follows the paper's setup:
+  - 500 positive training images, 20 random locations each.
+  - LRP context from [Zennit](https://github.com/chr5tphr/zennit) (BatchNorm folded into the convs; z-rule at residual
+    additions), with γ = 0 above the layer as for VGG-16 above `conv4_3`.
+  - Normalization from Eq. E.1, then `cxai.drsa.optimize` with 5000 iterations and the best of 3 restarts.
+  - Subspaces sorted by relevance.
+
+  It needs `pip install -e ".[drsa]"` and a clone of [drsa-demo](https://github.com/p16i/drsa-demo) next to this repo
+  (or `--drsa_demo_dir`). Run `--check` to verify that the γ = 0 context equals the gradient. Which subspace holds the
+  watermark has to be identified from the learned subspaces before choosing `--spurious_subspace`.
+
+```bash
+python experiments/compute_drsa_resnet.py --experiment carton        # -> data/projection_matrices/U_carton_resnet50_layer3.pt
+python experiments/run_watermark_pruning_experiment.py --experiment carton --pruner ncp \
+    --arch resnet50 --virtual_layer layer3 --u_filepath data/projection_matrices/U_carton_resnet50_layer3.pt \
+    --spurious_subspace <k> --eval_on_test
+python experiments/run_watermark_pruning_experiment.py --experiment carton --pruner vanilla --arch resnet50 --eval_on_test
+```
+Results are written to `results/watermark_experiment/carton_resnet50/{ncp,vanilla}/seed{N}/`
+(`plot_watermark_results.py --experiments carton_resnet50`).
+
 ## Pruned checkpoints
 
 Pruned models are saved as a `state_dict` plus per-layer channel counts, and load as standard
-torchvision VGG-16 models on CPU or GPU:
+torchvision VGG-16 or ResNet models on CPU or GPU:
 
 ```python
 from ncp.checkpoint import load_pruned_checkpoint
@@ -136,13 +172,13 @@ fetched with `python scripts/download_assets.py --all`.
 
 ## Repository layout
 ```
-src/ncp/            AugmentedVGG16, LRP rules, structural pruning, prune/fine-tune loop, checkpoints
+src/ncp/            AugmentedVGG16 / AugmentedResNet, LRP rules, structural pruning, prune/fine-tune loop, checkpoints
 experiments/        run_watermark_pruning_experiment.py (carton, crate), run_PFT_basketball.py
 analysis/           figure scripts
 scripts/            reproduction scripts (+ example SLURM array)
 data/images/        download scripts, split notes, 4 basketball example images
 data/projection_matrices/  DRSA projection matrices U (carton, crate, basketball)
-tests/              CPU unit tests (ablation, checkpoint round-trip)
+tests/              CPU unit tests (pruning surgery, LRP, ranking, splits, checkpoints, ResNet)
 ```
 
 ## Citation
