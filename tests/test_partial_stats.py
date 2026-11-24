@@ -46,7 +46,7 @@ def test_stats_are_saved_after_every_evaluation(watermark_experiment, tmp_path, 
     with pytest.raises(_Stop):
         rw.run_one(rw.get_args())
 
-    run_dir = out / "carton_resnet18" / "vanilla" / "seed0"
+    run_dir = out / "carton_resnet18_layer3" / "vanilla" / "seed0"
     assert not (run_dir / "stats.pt").exists()
     partial = torch.load(run_dir / "stats.partial.pt", map_location="cpu", weights_only=False)
     assert partial["complete"] is False

@@ -12,9 +12,10 @@ Only block-internal channels are pruned; see resnet.py for why.
 from heapq import nsmallest
 from operator import itemgetter
 
+import torch
 import torch.nn as nn
 
-from .lrp_resnet import resnet_lrp_backward, resnet_lrp_forward
+from .lrp_resnet import clear_lrp_state, resnet_lrp_backward, resnet_lrp_forward
 from .prune_vgg import shift_pruning_plan
 from .resnet import prunable_conv_names, prune_resnet_channel
 
@@ -85,12 +86,15 @@ class ResNetFilterPruner:
             values = conv_relevance[name].abs().sum(dim=(0, 2, 3))
             self.filter_ranks[name] = values if name not in self.filter_ranks else self.filter_ranks[name] + values
         self._ops = None
+        clear_lrp_state(self.adapter.model)
 
     def normalize_ranks_per_layer(self):
         for name in self.filter_ranks:
             if self.args.relevance:
                 v = self.filter_ranks[name]
-                self.filter_ranks[name] = (v / v.sum()).cpu()
+                total = v.sum()
+                # a layer with no relevance at all: rank its filters 0, not NaN
+                self.filter_ranks[name] = (v / total if total > 0 else torch.zeros_like(v)).cpu()
 
     def lowest_ranking_filters(self, num: int) -> list:
         data = [(name, j, score)

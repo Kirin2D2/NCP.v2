@@ -107,6 +107,18 @@ def resnet_lrp_forward(model: nn.Module, x: torch.Tensor):
     return logits, ops
 
 
+def clear_lrp_state(model: nn.Module):
+    """Drop the activations resnet_lrp_forward attached to the model's own modules.
+
+    (The fused conv modules live only in ops and are freed with it.) Call this once the
+    backward pass is done, so the last batch does not stay on the GPU.
+    """
+    for module in (model.maxpool, model.fc, getattr(model, "encode", None), getattr(model, "decode", None)):
+        if module is not None:
+            for attr in ("input", "output"):
+                module.__dict__.pop(attr, None)
+
+
 def _backward(ops, R, conv_relevance):
     for op in reversed(ops):
         kind = op[0]
@@ -145,6 +157,9 @@ def virtual_layer_gradient(model: nn.Module, x: torch.Tensor, target: int) -> to
     So this is the DRSA context vector at every position, also where the activation is 0,
     which matches cxai and experiments/compute_drsa_resnet.py with gamma = 0.
     """
+    if not getattr(model, "augmented", False) or getattr(model, "encode", None) is None:
+        raise ValueError("virtual_layer_gradient needs an AugmentedResNet with its virtual layer "
+                         "enabled (model.augmented is True and model.encode exists)")
     store = {}
 
     def pre_hook(module, args):

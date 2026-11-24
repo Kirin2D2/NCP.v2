@@ -143,6 +143,9 @@ def _output_padding(module, S):
     Zero for stride 1; needed for strided convolutions, where several input sizes map to the
     same output size.
     """
+    if isinstance(module.padding, str):
+        # 'same' / 'valid' are only allowed by PyTorch for stride 1, where no output_padding is needed
+        return (0, 0)
     pads = []
     for dim in range(2):
         in_size = module.input.shape[-2 + dim]

@@ -509,7 +509,9 @@ class FilterPruner:
         for i in self.filter_ranks:
             if self.args.relevance:
                 v = self.filter_ranks[i]
-                self.filter_ranks[i] = (v / v.sum()).cpu()
+                total = v.sum()
+                # a layer with no relevance at all: rank its filters 0, not NaN
+                self.filter_ranks[i] = (v / total if total > 0 else torch.zeros_like(v)).cpu()
 
     def lowest_ranking_filters(self, num: int) -> list:
         """

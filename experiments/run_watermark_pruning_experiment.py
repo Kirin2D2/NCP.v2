@@ -50,7 +50,7 @@ python experiments/run_watermark_pruning_experiment.py \\
 
 # ResNet backbone (virtual layer after layer3; needs a DRSA matrix computed at that layer):
 python experiments/run_watermark_pruning_experiment.py \\
-    --experiment carton --pruner ncp --arch resnet50 --u_filepath U_resnet50_layer3.pt \\
+    --experiment carton --pruner ncp --arch resnet50 --u_filepath data/projection_matrices/U_carton_resnet50_layer3.pt \\
     --spurious_subspace 3 --eval_on_test
 """
 
@@ -674,6 +674,12 @@ def warmup_head(model, train_loader, args, criterion):
         model.augmented = False
 
     model.train()
+    # Only the head is trained: keep BatchNorm (ResNets) on its pretrained running statistics,
+    # the ones the DRSA matrix was fit with. (Per-iteration fine-tuning trains the convs too,
+    # and leaves BatchNorm in training mode.)
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
     for epoch in range(args.warmup_epochs):
         running_loss = 0.0
         for bidx, batch in enumerate(train_loader):
@@ -734,6 +740,9 @@ def run_one(args):
     U_orig = None
     if natural_test_samples is not None and args.arch == 'vgg16':
         U_orig = load_u_matrix(u_path)
+    elif natural_test_samples is not None and args.pruner == 'ncp':
+        print("[warn] --natural_test: per-subspace relevance is only tracked for VGG16; "
+              "stats['subspace_relevance'] will be empty for this ResNet run.")
 
     # Tuner (calls setup_dataloaders internally)
     tuner = WatermarkPruningFineTuner(
@@ -754,8 +763,9 @@ def run_one(args):
     for p in model.parameters():
         p.requires_grad = True
 
-    # VGG16 keeps the paper layout; other backbones get their own experiment directory
-    exp_dir = args.experiment if args.arch == 'vgg16' else f'{args.experiment}_{args.arch}'
+    # VGG16 keeps the paper layout; other backbones get their own directory per virtual layer
+    exp_dir = (args.experiment if args.arch == 'vgg16'
+               else f'{args.experiment}_{args.arch}_{args.virtual_layer}')
     out_dir = Path(args.out_dir) / exp_dir / args.pruner / f'seed{args.seed}'
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / 'stats.pt'
@@ -778,7 +788,8 @@ def run_one(args):
     )
 
     if args.save_model:
-        # Virtual layer was removed before final fine-tuning, so both pruners save a plain VGG16.
+        # Virtual layer was removed before final fine-tuning, so both pruners save a plain
+        # VGG16 / torchvision ResNet.
         model_path = out_dir / f'{args.pruner}.pt'
         save_pruned_checkpoint(model_path, tuner.model, meta={
             'experiment': args.experiment,
