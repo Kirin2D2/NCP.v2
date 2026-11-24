@@ -853,7 +853,8 @@ class PruningFineTuner:
     def prune(self, fine_tune_conv_layers: bool = True,
               fine_tune_without_augmented_layers: bool = False,
               final_finetune_epochs: int = 5,
-              iter_finetune_epochs: int = 2):
+              iter_finetune_epochs: int = 2,
+              skip_pruning: bool = False):
         """
         Full iterative prune-and-fine-tune loop.
 
@@ -861,6 +862,8 @@ class PruningFineTuner:
             (otherwise only classifier is updated).
         fine_tune_without_augmented_layers: debug flag for augmented models;
             temporarily disables the augmented path during each fine-tune step.
+        skip_pruning: control run. Same iterations, fine-tuning and evaluations, but
+            no filters are ranked or removed.
         """
         self.train_loss_tot = []
         self.test_loss_tot = []
@@ -903,9 +906,13 @@ class PruningFineTuner:
             self.model.augmented = True
 
         for kk in range(iterations):
-            print("Ranking filters.. {}".format(kk), flush=True)
             self.niter += 1
-            prune_targets = self.get_candidates_to_prune(num_filters_to_prune_per_iteration)
+            if skip_pruning:
+                print(f"Fine-tune-only control: iteration {kk}, nothing pruned.", flush=True)
+                prune_targets = []
+            else:
+                print("Ranking filters.. {}".format(kk), flush=True)
+                prune_targets = self.get_candidates_to_prune(num_filters_to_prune_per_iteration)
 
             layers_pruned = {}
             for layer_index, filter_index in prune_targets:

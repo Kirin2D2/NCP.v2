@@ -610,7 +610,7 @@ def resolve_u_path(args, cfg):
         return Path(args.u_filepath)
     if args.arch == 'vgg16':
         return cfg['u_path']
-    if args.pruner == 'ncp':
+    if uses_virtual_layer(args):
         D = virtual_layer_width(args)
         raise ValueError(f"--u_filepath is required for --arch {args.arch}: a {D}x{D} DRSA projection "
                          f"matrix computed at {args.virtual_layer}")
@@ -619,7 +619,7 @@ def resolve_u_path(args, cfg):
 
 def build_model(args, u_path):
     if args.arch == 'vgg16':
-        if args.pruner == 'ncp':
+        if uses_virtual_layer(args):
             U = load_u_matrix(u_path)
             U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
             model = AugmentedVGG16(U_ab, U_ab_T)
@@ -627,7 +627,7 @@ def build_model(args, u_path):
             model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         model.classifier[6] = nn.Linear(4096, 2)
     else:
-        if args.pruner == 'ncp':
+        if uses_virtual_layer(args):
             U = load_u_matrix(u_path)
             U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
             model = AugmentedResNet(args.arch, U_ab, U_ab_T, split_layer=args.virtual_layer)
@@ -643,7 +643,12 @@ def build_model(args, u_path):
 def make_adapter(args, model):
     if args.arch != 'vgg16':
         return ResNetAdapter(model)
-    return AugmentedVGGAdapter(model) if args.pruner == 'ncp' else VanillaVGGAdapter(model)
+    return AugmentedVGGAdapter(model) if uses_virtual_layer(args) else VanillaVGGAdapter(model)
+
+
+def uses_virtual_layer(args):
+    """CNP, and the fine-tune-through-the-ablated-virtual-layer control."""
+    return args.pruner in ('ncp', 'finetune_ablated')
 
 
 def classifier_head(model):
@@ -673,10 +678,19 @@ def warmup_head(model, train_loader, args, criterion):
     if _was_augmented:
         model.augmented = False
 
+    # BatchNorm (ResNets): with --warmup_bn reestimate, first recompute the running statistics
+    # once on the training set (no gradients, plain average over all batches; AdaBN-style
+    # adaptation). With 'frozen' they stay at the pretrained ImageNet values. Either way the
+    # head is then trained with BatchNorm in eval mode, so it sees the same normalization in
+    # training and evaluation. (Per-iteration fine-tuning trains the convs too, and leaves
+    # BatchNorm in training mode.)
+    if getattr(args, 'warmup_bn', 'reestimate') == 'reestimate' and any(
+            isinstance(m, nn.modules.batchnorm._BatchNorm) for m in model.modules()):
+        print("  re-estimating BatchNorm statistics on the training set")
+        torch.optim.swa_utils.update_bn(
+            train_loader, model, device=torch.device('cuda') if args.cuda else torch.device('cpu'))
+
     model.train()
-    # Only the head is trained: keep BatchNorm (ResNets) on its pretrained running statistics,
-    # the ones the DRSA matrix was fit with. (Per-iteration fine-tuning trains the convs too,
-    # and leaves BatchNorm in training mode.)
     for m in model.modules():
         if isinstance(m, nn.modules.batchnorm._BatchNorm):
             m.eval()
@@ -782,9 +796,12 @@ def run_one(args):
     print("=== Pruning ===")
     tuner.prune(
         fine_tune_conv_layers=args.fine_tune_conv_layers,
-        fine_tune_without_augmented_layers=args.fine_tune_without_augmented_layers,
+        # finetune_ablated: the point of the control is to train through the ablated layer
+        fine_tune_without_augmented_layers=(args.fine_tune_without_augmented_layers
+                                            and args.pruner != 'finetune_ablated'),
         final_finetune_epochs=args.final_finetune_epochs,
         iter_finetune_epochs=args.iter_finetune_epochs,
+        skip_pruning=(args.pruner in ('finetune_only', 'finetune_ablated')),
     )
 
     if args.save_model:
@@ -829,7 +846,9 @@ def collect_stats(args, tuner, complete):
         'num_workers':           args.num_workers,
         'natural_test':          args.natural_test,
         # CNP only: whether the per-iteration fine-tuning bypassed the (ablated) virtual layer
-        'fine_tune_without_augmented_layers': args.fine_tune_without_augmented_layers,
+        'fine_tune_without_augmented_layers': (args.fine_tune_without_augmented_layers
+                                               and args.pruner != 'finetune_ablated'),
+        'warmup_bn':             args.warmup_bn,
         'n_val':                 N_VAL,
         'n_train_pos':           N_TRAIN_POS,
         'n_train_neg':           N_TRAIN_NEG,
@@ -864,8 +883,17 @@ def get_args():
 
     p.add_argument('--experiment', choices=['carton', 'crate'], required=True,
                    help='Which binary classification task to run.')
-    p.add_argument('--pruner', choices=['ncp', 'vanilla'], required=True,
-                   help="'ncp' = CNP (concept ablation + LRP pruning); 'vanilla' = LRP pruning only.")
+    p.add_argument('--pruner', choices=['ncp', 'vanilla', 'finetune_only', 'finetune_ablated'], required=True,
+                   help="'ncp' = CNP (concept ablation + LRP pruning); 'vanilla' = LRP pruning only; "
+                        "'finetune_only' = control: same fine-tuning and evaluations, nothing pruned; "
+                        "'finetune_ablated' = the same, but fine-tuned through the ablated virtual layer "
+                        "(removed before the final fine-tune, as for CNP).")
+    p.add_argument('--warmup_bn', choices=['frozen', 'reestimate'], default='reestimate',
+                   help="ResNets: before the head warmup, recompute BatchNorm statistics once on the "
+                        "training set ('reestimate', default), or keep the ImageNet statistics ('frozen'). "
+                        "With 'frozen', the first fine-tuning round adapts BatchNorm instead, so the "
+                        "pre-pruning baseline is not representative of the unpruned fine-tuned model. "
+                        "No effect on VGG16, which has no BatchNorm.")
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--arch', choices=['vgg16', 'resnet18', 'resnet34', 'resnet50'], default='vgg16',
                    help='Backbone (the paper uses vgg16).')
