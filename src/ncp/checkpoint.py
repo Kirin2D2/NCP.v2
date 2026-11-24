@@ -1,30 +1,29 @@
 """
 checkpoint.py
 
-Portable checkpoints for pruned VGG16 models.
+Portable checkpoints for pruned VGG16 and ResNet models.
 
-Pruned models have irregular per-layer channel counts, so a plain state_dict
-cannot be loaded into a stock torchvision VGG16. Instead of pickling the whole
-nn.Module (which breaks when code moves and requires torch.load(weights_only=False)),
-we store:
+Pruned models have irregular per-layer channel counts, so a plain state_dict cannot be loaded
+into a stock torchvision model. Instead of pickling the whole nn.Module (which breaks when code
+moves and requires torch.load(weights_only=False)), we store:
 
     {
       'format_version': 1,
-      'arch':           'vgg16',
-      'channels':       [13 ints],   # out_channels of every conv, in forward order
+      'arch':           'vgg16' | 'resnet18' | 'resnet34' | 'resnet50',
+      'channels':       vgg16:  [13 ints]  out_channels of every conv, in forward order
+                        resnet: {conv name: out_channels} for block-internal convs
       'num_classes':    int,
-      'state_dict':     {...},       # canonical torchvision keys: features.* / classifier.*
-      'meta':           {...},       # primitives only (loadable with weights_only=True)
+      'state_dict':     {...},    # canonical torchvision keys
+      'meta':           {...},    # primitives only (loadable with weights_only=True)
     }
 
-and rebuild the architecture with build_pruned_vgg16(channels) before loading.
+and rebuild the architecture (build_pruned_vgg16 / build_pruned_resnet) before loading.
 
-Both vanilla pruned models (model.features) and CNP pruned models
-(model.before / model.after after on_before_final_finetune removed encode/decode)
-are saved in the same canonical layout and load as a torchvision VGG.
+Vanilla and CNP pruned models are saved in the same layout (the virtual layer must already be
+removed) and load as plain torchvision models.
 
-AugmentedVGG16 has no avgpool; torchvision's AdaptiveAvgPool2d((7, 7)) is the
-identity for 224x224 inputs, so logits match for the standard input size.
+AugmentedVGG16 has no avgpool; torchvision's AdaptiveAvgPool2d((7, 7)) is the identity for
+224x224 inputs, so logits match for the standard input size.
 """
 
 import torch
@@ -32,6 +31,8 @@ import torch.nn as nn
 from torchvision.models.vgg import VGG
 
 from .prune_layer import get_conv_seq_and_name
+from .resnet import ARCHS as RESNET_ARCHS
+from .resnet import STAGES, conv_bn_pairs, prunable_conv_names, shrink_block_channels
 
 FORMAT_VERSION = 1
 
@@ -40,16 +41,42 @@ VGG16_CFG = [64, 64, "M", 128, 128, "M", 256, 256, 256, "M",
              512, 512, 512, "M", 512, 512, 512, "M"]
 NUM_CONVS = sum(1 for v in VGG16_CFG if v != "M")  # 13
 
+# blocks per stage and block type, used to identify plain torchvision ResNets
+RESNET_LAYOUTS = {
+    "resnet18": ([2, 2, 2, 2], False),
+    "resnet34": ([3, 4, 6, 3], False),
+    "resnet50": ([3, 4, 6, 3], True),
+}
+
+
+def _is_resnet(model: nn.Module) -> bool:
+    return hasattr(model, "layer1") and hasattr(model, "fc")
+
+
+def resnet_arch(model: nn.Module) -> str:
+    """Architecture name of an AugmentedResNet or torchvision ResNet."""
+    arch = getattr(model, "arch", None)
+    if arch in RESNET_ARCHS:
+        return arch
+    layout = ([len(getattr(model, s)) for s in STAGES], len(conv_bn_pairs(model.layer1[0])) == 3)
+    for name, expected in RESNET_LAYOUTS.items():
+        if layout == (expected[0], expected[1]):
+            return name
+    raise ValueError(f"Unrecognized ResNet layout {layout}")
+
 
 def _conv_layers(model: nn.Module) -> list:
-    """Conv2d layers of the feature extractor in forward order, excluding encode/decode."""
+    """VGG: Conv2d layers of the feature extractor in forward order, excluding encode/decode."""
     seq, _ = get_conv_seq_and_name(model)
     skip = {id(getattr(model, name)) for name in ("encode", "decode") if hasattr(model, name)}
     return [m for m in seq if isinstance(m, nn.Conv2d) and id(m) not in skip]
 
 
-def extract_channels(model: nn.Module) -> list:
-    """Return out_channels of all 13 VGG16 convs (including conv4_3), in forward order."""
+def extract_channels(model: nn.Module):
+    """VGG16: out_channels of all 13 convs (including conv4_3), in forward order.
+    ResNet: {conv name: out_channels} for every block-internal (prunable) conv."""
+    if _is_resnet(model):
+        return {name: model.get_submodule(name).out_channels for name in prunable_conv_names(model)}
     channels = [m.out_channels for m in _conv_layers(model)]
     if len(channels) != NUM_CONVS:
         raise ValueError(f"Expected {NUM_CONVS} conv layers, found {len(channels)}")
@@ -57,8 +84,16 @@ def extract_channels(model: nn.Module) -> list:
 
 
 def _num_classes(model: nn.Module) -> int:
+    if _is_resnet(model):
+        return model.fc.out_features
     linears = [m for m in model.classifier if isinstance(m, nn.Linear)]
     return linears[-1].out_features
+
+
+def _require_no_virtual_layer(model: nn.Module):
+    if hasattr(model, "encode") or hasattr(model, "decode"):
+        raise ValueError("Remove the virtual concept layer (encode/decode) before saving; "
+                         "see the adapter's on_before_final_finetune().")
 
 
 def to_vgg16_state_dict(model: nn.Module) -> dict:
@@ -70,9 +105,7 @@ def to_vgg16_state_dict(model: nn.Module) -> dict:
     if hasattr(model, "features"):
         sd = model.state_dict()
     elif hasattr(model, "before"):
-        if hasattr(model, "encode") or hasattr(model, "decode"):
-            raise ValueError("Remove the virtual concept layer (encode/decode) before saving; "
-                             "see AugmentedVGGAdapter.on_before_final_finetune().")
+        _require_no_virtual_layer(model)
         split = len(model.before)
         sd = {}
         for k, v in model.state_dict().items():
@@ -131,17 +164,34 @@ def build_pruned_vgg16(channels, num_classes: int = 2) -> VGG:
     return model
 
 
+def build_pruned_resnet(arch: str, channels: dict, num_classes: int = 2) -> nn.Module:
+    """Build an (uninitialized) torchvision ResNet with the given block-internal channel counts."""
+    model = RESNET_ARCHS[arch](weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    for name, n in channels.items():
+        block_name, conv_attr = name.rsplit(".", 1)
+        shrink_block_channels(model.get_submodule(block_name), int(conv_attr[len("conv"):]), n)
+    return model
+
+
 def save_pruned_checkpoint(path, model: nn.Module, meta: dict = None) -> None:
-    """Save a pruned VGG16 (vanilla or CNP) as state_dict + channel counts.
+    """Save a pruned VGG16 or ResNet (vanilla or CNP) as state_dict + channel counts.
 
     meta should contain only primitives/lists/dicts so the file loads with weights_only=True.
     """
+    if _is_resnet(model):
+        _require_no_virtual_layer(model)
+        arch = resnet_arch(model)
+        state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    else:
+        arch = "vgg16"
+        state_dict = to_vgg16_state_dict(model)
     torch.save({
         "format_version": FORMAT_VERSION,
-        "arch": "vgg16",
+        "arch": arch,
         "channels": extract_channels(model),
         "num_classes": _num_classes(model),
-        "state_dict": to_vgg16_state_dict(model),
+        "state_dict": state_dict,
         "meta": dict(meta or {}),
     }, path)
 
@@ -149,15 +199,17 @@ def save_pruned_checkpoint(path, model: nn.Module, meta: dict = None) -> None:
 def load_pruned_checkpoint(path, map_location="cpu"):
     """Load a checkpoint written by save_pruned_checkpoint.
 
-    Returns (model, info) where model is a torchvision VGG in eval mode and info holds
+    Returns (model, info) where model is a torchvision VGG/ResNet in eval mode and info holds
     every checkpoint field except the state_dict.
     """
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
-    version = ckpt.get("format_version")
-    if version != FORMAT_VERSION or ckpt.get("arch") != "vgg16":
-        raise ValueError(f"Unsupported checkpoint (format_version={version!r}, "
-                         f"arch={ckpt.get('arch')!r}) at {path!r}")
-    model = build_pruned_vgg16(ckpt["channels"], ckpt["num_classes"])
+    version, arch = ckpt.get("format_version"), ckpt.get("arch")
+    if version != FORMAT_VERSION or (arch != "vgg16" and arch not in RESNET_ARCHS):
+        raise ValueError(f"Unsupported checkpoint (format_version={version!r}, arch={arch!r}) at {path!r}")
+    if arch == "vgg16":
+        model = build_pruned_vgg16(ckpt["channels"], ckpt["num_classes"])
+    else:
+        model = build_pruned_resnet(arch, ckpt["channels"], ckpt["num_classes"])
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
     info = {k: v for k, v in ckpt.items() if k != "state_dict"}

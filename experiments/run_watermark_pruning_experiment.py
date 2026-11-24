@@ -47,6 +47,11 @@ python experiments/run_watermark_pruning_experiment.py \\
     --experiment carton --pruner ncp --spurious_subspace 3 --seed 0 --eval_on_test
 
 # All seeds / pruners / experiments: scripts/reproduce_watermark.sh
+
+# ResNet backbone (virtual layer after layer3; needs a DRSA matrix computed at that layer):
+python experiments/run_watermark_pruning_experiment.py \\
+    --experiment carton --pruner ncp --arch resnet50 --u_filepath U_resnet50_layer3.pt \\
+    --spurious_subspace 3 --eval_on_test
 """
 
 import argparse
@@ -66,6 +71,8 @@ from ncp.data import default_num_workers, loader_kwargs
 from ncp.lrp import lrp as lrp_fn
 from ncp.paths import IMAGES_DIR, PROJECTION_DIR, RESULTS_ROOT
 from ncp.prune_vgg import PruningFineTuner, VanillaVGGAdapter, AugmentedVGGAdapter
+from ncp.prune_resnet import ResNetAdapter
+from ncp.resnet import AugmentedResNet, STAGE_WIDTHS
 from ncp.watermark_transform import AddWatermark
 
 
@@ -579,6 +586,9 @@ class WatermarkPruningFineTuner(PruningFineTuner):
         result = self._compute_subspace_relevances()
         if result is not None:
             self.subspace_relevance_tot.append(result)
+        on_eval = getattr(self, 'on_eval', None)   # run_one: save stats.partial.pt
+        if on_eval is not None:
+            on_eval()
 
     def prune(self, **kwargs):
         self.subspace_relevance_tot = []
@@ -589,19 +599,56 @@ class WatermarkPruningFineTuner(PruningFineTuner):
 # Model building
 # ---------------------------------------------------------------------------
 
-def build_model(args, u_path):
-    if args.pruner == 'ncp':
-        U = load_u_matrix(u_path)
-        U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
-        model = AugmentedVGG16(U_ab, U_ab_T)
-    else:
-        model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+def virtual_layer_width(args):
+    """Width D of the virtual concept layer (VGG16 conv4_3: 512)."""
+    return 512 if args.arch == 'vgg16' else STAGE_WIDTHS[args.arch][args.virtual_layer]
 
-    model.classifier[6] = nn.Linear(4096, 2)
+
+def resolve_u_path(args, cfg):
+    """DRSA matrix to use: --u_filepath, else the paper matrix (VGG16 only)."""
+    if args.u_filepath:
+        return Path(args.u_filepath)
+    if args.arch == 'vgg16':
+        return cfg['u_path']
+    if args.pruner == 'ncp':
+        D = virtual_layer_width(args)
+        raise ValueError(f"--u_filepath is required for --arch {args.arch}: a {D}x{D} DRSA projection "
+                         f"matrix computed at {args.virtual_layer}")
+    return None
+
+
+def build_model(args, u_path):
+    if args.arch == 'vgg16':
+        if args.pruner == 'ncp':
+            U = load_u_matrix(u_path)
+            U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
+            model = AugmentedVGG16(U_ab, U_ab_T)
+        else:
+            model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        model.classifier[6] = nn.Linear(4096, 2)
+    else:
+        if args.pruner == 'ncp':
+            U = load_u_matrix(u_path)
+            U_ab, U_ab_T = ablate_subspace_matrix(U, list(args.subspace_dims), list(args.spurious_subspace))
+            model = AugmentedResNet(args.arch, U_ab, U_ab_T, split_layer=args.virtual_layer)
+        else:
+            model = AugmentedResNet(args.arch, split_layer=args.virtual_layer)
+        model.fc = nn.Linear(model.fc.in_features, 2)
 
     if args.cuda:
         model = model.cuda()
     return model
+
+
+def make_adapter(args, model):
+    if args.arch != 'vgg16':
+        return ResNetAdapter(model)
+    return AugmentedVGGAdapter(model) if args.pruner == 'ncp' else VanillaVGGAdapter(model)
+
+
+def classifier_head(model):
+    """The final linear layer trained during warmup (ResNet fc / VGG16 classifier[6])."""
+    return model.fc if hasattr(model, 'fc') else model.classifier[6]
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +656,7 @@ def build_model(args, u_path):
 # ---------------------------------------------------------------------------
 
 def warmup_head(model, train_loader, args, criterion):
-    """Train classifier[6] only, for exactly warmup_epochs on the (biased) train set.
+    """Train the classifier head only, for exactly warmup_epochs on the (biased) train set.
 
     No early stopping: the evaluation sets are reserved for evaluation only.
     The augmented path is bypassed during warmup so the head learns from
@@ -617,10 +664,10 @@ def warmup_head(model, train_loader, args, criterion):
     """
     for p in model.parameters():
         p.requires_grad = False
-    for p in model.classifier[6].parameters():
+    for p in classifier_head(model).parameters():
         p.requires_grad = True
 
-    optimizer = torch.optim.Adam(model.classifier[6].parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(classifier_head(model).parameters(), lr=args.lr)
 
     _was_augmented = getattr(model, 'augmented', False)
     if _was_augmented:
@@ -677,16 +724,16 @@ def run_one(args):
         )
 
     # Model
-    model   = build_model(args, cfg['u_path'])
-    adapter = (AugmentedVGGAdapter(model) if args.pruner == 'ncp'
-               else VanillaVGGAdapter(model))
+    u_path  = resolve_u_path(args, cfg)
+    model   = build_model(args, u_path)
+    adapter = make_adapter(args, model)
 
     # Original (non-ablated) U matrix for per-iteration subspace relevance.
     # Loaded separately from the ablated model so the ablation does not affect
     # the projection used to evaluate subspace activity.
     U_orig = None
-    if natural_test_samples is not None:
-        U_orig = load_u_matrix(cfg['u_path'])
+    if natural_test_samples is not None and args.arch == 'vgg16':
+        U_orig = load_u_matrix(u_path)
 
     # Tuner (calls setup_dataloaders internally)
     tuner = WatermarkPruningFineTuner(
@@ -707,6 +754,20 @@ def run_one(args):
     for p in model.parameters():
         p.requires_grad = True
 
+    # VGG16 keeps the paper layout; other backbones get their own experiment directory
+    exp_dir = args.experiment if args.arch == 'vgg16' else f'{args.experiment}_{args.arch}'
+    out_dir = Path(args.out_dir) / exp_dir / args.pruner / f'seed{args.seed}'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / 'stats.pt'
+    partial_path = out_dir / 'stats.partial.pt'
+
+    # After every evaluation, write what has been measured so far to stats.partial.pt, so a run
+    # that stops early keeps its results. stats.pt itself is only written once the run has
+    # finished; scripts/reproduce_watermark.sh and the notebooks skip runs that have it.
+    def save_partial():
+        torch.save(collect_stats(args, tuner, complete=False), partial_path)
+    tuner.on_eval = save_partial
+
     # Prune
     print("=== Pruning ===")
     tuner.prune(
@@ -716,14 +777,13 @@ def run_one(args):
         iter_finetune_epochs=args.iter_finetune_epochs,
     )
 
-    out_dir = Path(args.out_dir) / args.experiment / args.pruner / f'seed{args.seed}'
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     if args.save_model:
         # Virtual layer was removed before final fine-tuning, so both pruners save a plain VGG16.
         model_path = out_dir / f'{args.pruner}.pt'
         save_pruned_checkpoint(model_path, tuner.model, meta={
             'experiment': args.experiment,
+            'arch': args.arch,
+            'virtual_layer': args.virtual_layer if args.arch != 'vgg16' else 'conv4_3',
             'pruner': args.pruner,
             'seed': args.seed,
             'spurious_subspace': list(args.spurious_subspace),
@@ -734,9 +794,18 @@ def run_one(args):
         })
         print(f"[saved] {model_path}")
 
-    out_path = out_dir / 'stats.pt'
-    torch.save({
+    torch.save(collect_stats(args, tuner, complete=True), out_path)
+    partial_path.unlink(missing_ok=True)
+    print(f"[saved] {out_path}")
+
+
+def collect_stats(args, tuner, complete):
+    """Everything stats.pt records: run settings plus every evaluation so far."""
+    return {
+        'complete':              complete,
         'experiment':            args.experiment,
+        'arch':                  args.arch,
+        'virtual_layer':         args.virtual_layer if args.arch != 'vgg16' else 'conv4_3',
         'pruner':                args.pruner,
         'seed':                  args.seed,
         'spurious_subspace':     args.spurious_subspace,
@@ -748,6 +817,8 @@ def run_one(args):
         'eval_on_test':          args.eval_on_test,
         'num_workers':           args.num_workers,
         'natural_test':          args.natural_test,
+        # CNP only: whether the per-iteration fine-tuning bypassed the (ablated) virtual layer
+        'fine_tune_without_augmented_layers': args.fine_tune_without_augmented_layers,
         'n_val':                 N_VAL,
         'n_train_pos':           N_TRAIN_POS,
         'n_train_neg':           N_TRAIN_NEG,
@@ -769,8 +840,7 @@ def run_one(args):
         # Per-iteration subspace LRP relevance (CNP only, natural test set).
         # Each entry: {niter, mean_all (K,), mean_wm0 (K,), mean_wm1 (K,)}
         'subspace_relevance':    tuner.subspace_relevance_tot,
-    }, out_path)
-    print(f"[saved] {out_path}")
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +856,13 @@ def get_args():
     p.add_argument('--pruner', choices=['ncp', 'vanilla'], required=True,
                    help="'ncp' = CNP (concept ablation + LRP pruning); 'vanilla' = LRP pruning only.")
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--arch', choices=['vgg16', 'resnet18', 'resnet34', 'resnet50'], default='vgg16',
+                   help='Backbone (the paper uses vgg16).')
+    p.add_argument('--virtual_layer', choices=['layer1', 'layer2', 'layer3', 'layer4'], default='layer3',
+                   help='ResNet only: stage after which the virtual concept layer is inserted.')
+    p.add_argument('--u_filepath', type=str, default=None,
+                   help='DRSA projection matrix (D x D). Defaults to the paper matrix for vgg16; '
+                        'required for ResNets.')
 
     # Subspace to ablate (CNP only).  Identify by inspecting DRSA subspace heatmaps.
     p.add_argument('--spurious_subspace', type=int, nargs='+', default=[0],
@@ -838,7 +915,9 @@ def get_args():
                    dest='fine_tune_without_augmented_layers', action='store_false')
 
     # CNP subspace dims
-    p.add_argument('--subspace_dims', type=int, nargs='+', default=SUBSPACE_DIMS)
+    p.add_argument('--subspace_dims', type=int, nargs='+', default=None,
+                   help='Subspace sizes (sum = virtual layer width). Default: 4 equal subspaces '
+                        '(4 x 128 for VGG16 conv4_3).')
 
     # Device
     p.add_argument('--no_cuda', dest='cuda', action='store_false',
@@ -862,6 +941,10 @@ def get_args():
     args.cuda = args.cuda and torch.cuda.is_available()
     if args.num_workers is None:
         args.num_workers = default_num_workers(args.cuda)
+    if args.subspace_dims is None:
+        args.subspace_dims = [virtual_layer_width(args) // 4] * 4
+    if sum(args.subspace_dims) != virtual_layer_width(args):
+        p.error(f'--subspace_dims must sum to the virtual layer width {virtual_layer_width(args)}')
 
     # Required by PruningFineTuner.test() for subgroup stats
     args.data_type = 'watermark_imagenet'

@@ -175,6 +175,27 @@ class VGGAdapterBase:
         """
         pass
 
+    # ------------------------------------------------------------------
+    # Hooks used by PruningFineTuner (overridden by prune_resnet.ResNetAdapter)
+    # ------------------------------------------------------------------
+
+    def make_pruner(self, args):
+        """Object that accumulates filter relevance and builds the pruning plan."""
+        return FilterPruner(self, args)
+
+    def layer_out_channels(self, model: nn.Module, layer) -> int:
+        """Current number of filters in the prunable layer `layer`."""
+        seq, _ = get_conv_seq_and_name(model)
+        return seq[layer].out_channels
+
+    def prune_filter(self, model: nn.Module, layer, filter_index: int, cuda_flag: bool = False) -> nn.Module:
+        """Structurally remove one filter; returns the updated model."""
+        return prune_conv_layer_sequential(model, layer, filter_index, cuda_flag=cuda_flag)
+
+    def head_parameters(self):
+        """Classifier parameters, trained on their own when conv layers are not fine-tuned."""
+        return self.model.classifier.parameters()
+
 
 # ---------------------------------------------------------------------------
 # VanillaVGGAdapter
@@ -382,6 +403,21 @@ class AugmentedVGGAdapter(VGGAdapterBase):
 # FilterPruner
 # ---------------------------------------------------------------------------
 
+def shift_pruning_plan(filters_to_prune) -> list:
+    """Turn (layer, filter, score) tuples into a pruning plan of (layer, filter) pairs.
+
+    Filters are grouped per layer (in order of first appearance) and sorted; each index is
+    reduced by the number of filters already removed from that layer, so the plan can be
+    applied one removal at a time.
+    """
+    filters_per_layer = {}
+    for (layer, f, _) in filters_to_prune:
+        filters_per_layer.setdefault(layer, []).append(f)
+    return [(layer, f - i)
+            for layer, filters in filters_per_layer.items()
+            for i, f in enumerate(sorted(filters))]
+
+
 class FilterPruner:
     """
     Registers forward hooks on model modules (via adapter), runs forward/backward
@@ -499,24 +535,7 @@ class FilterPruner:
         indices to account for filters removed earlier in the same layer.
         Returns list of (layer_idx, adjusted_filter_idx).
         """
-        filters_to_prune = self.lowest_ranking_filters(num_filters_to_prune)
-
-        # Group by layer
-        filters_per_layer = {}
-        for (l, f, _) in filters_to_prune:
-            filters_per_layer.setdefault(l, []).append(f)
-
-        # Sort and adjust indices: pruning filter i shifts all subsequent indices down by 1
-        for l in filters_per_layer:
-            filters_per_layer[l] = sorted(filters_per_layer[l])
-            for i in range(len(filters_per_layer[l])):
-                filters_per_layer[l][i] -= i
-
-        result = []
-        for l in filters_per_layer:
-            for f in filters_per_layer[l]:
-                result.append((l, f))
-        return result
+        return shift_pruning_plan(self.lowest_ranking_filters(num_filters_to_prune))
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +547,8 @@ class PruningFineTuner:
     Orchestrates the full prune-and-fine-tune loop.
 
     Accepts an adapter that encapsulates model-specific behaviour so this class
-    works identically for vanilla and augmented VGG16.
+    works identically for vanilla and augmented VGG16, and for ResNets
+    (prune_resnet.ResNetAdapter).
     """
 
     def __init__(self, args, model: nn.Module, adapter: VGGAdapterBase):
@@ -543,7 +563,7 @@ class PruningFineTuner:
         self.setup_dataloaders()
 
         self.criterion = nn.CrossEntropyLoss()
-        self.pruner = FilterPruner(self.adapter, args)
+        self.pruner = self.adapter.make_pruner(args)
         self.model.train()
         self.save_loss = True
 
@@ -808,7 +828,7 @@ class PruningFineTuner:
     def train(self, optimizer=None, epoches: int = 10):
         if optimizer is None:
             optimizer = optim.SGD(
-                self.model.classifier.parameters(),
+                self.adapter.head_parameters(),
                 lr=self.args.lr, momentum=self.args.momentum)
         for i in range(epoches):
             print("Epoch: ", i)
@@ -818,8 +838,8 @@ class PruningFineTuner:
     def get_candidates_to_prune(self, num_filters_to_prune: int) -> list:
         """
         Run a ranking pass (LRP) and return the pruning plan.
-        Uses model.eval() during ranking to disable VGG's dropout layers,
-        ensuring filter ranks are deterministic.
+        Uses model.eval() during ranking to disable dropout (VGG) and use BatchNorm
+        running statistics (ResNet), ensuring filter ranks are deterministic.
         """
         self.pruner.reset()
         self.model.eval()                           # disable dropout for stable LRP ranks
@@ -891,13 +911,11 @@ class PruningFineTuner:
             print("Layers that will be pruned", layers_pruned)
 
             # Early-exit: stop before any layer reaches 0 filters (disconnected network)
-            _conv_seq, _ = get_conv_seq_and_name(self.model)
-            _conv_mods = list(_conv_seq._modules.items())
             _disconnected = False
             for _li, _cnt in layers_pruned.items():
-                _m = _conv_mods[_li][1]
-                if isinstance(_m, nn.Conv2d) and _m.out_channels <= _cnt:
-                    print(f"[prune] Layer {_li} has {_m.out_channels} filter(s); "
+                _out = self.adapter.layer_out_channels(self.model, _li)
+                if _out <= _cnt:
+                    print(f"[prune] Layer {_li} has {_out} filter(s); "
                           f"pruning {_cnt} would disconnect the network. Stopping early.")
                     _disconnected = True
                     break
@@ -909,7 +927,7 @@ class PruningFineTuner:
 
             model = self.model.cpu()
             for layer_index, filter_index in prune_targets:
-                model = prune_conv_layer_sequential(
+                model = self.adapter.prune_filter(
                     model, layer_index, filter_index, cuda_flag=self.args.cuda)
 
             self.model = model.cuda() if self.args.cuda else model
