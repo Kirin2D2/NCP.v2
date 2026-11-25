@@ -34,6 +34,13 @@ ASSETS = {
         "watermark_experiment_bn_reestimate/carton_resnet50_layer3/ncp/seed0/stats.pt",
         "265272f59575d53eb98f6a1d5fd5ebc3b3f55edb837dce6486dfb2f5c7fceace",
     ),
+    # Controls for the notebook's appendix, all with the frozen-BatchNorm head warmup: CNP and vanilla
+    # (5 seeds each), and CNP fine-tuned through the ablated virtual layer (5 seeds).
+    "carton_resnet50_layer3_controls": (
+        "carton_resnet50_layer3_controls.zip",
+        "watermark_experiment_ft_with_virtual/carton_resnet50_layer3/ncp/seed0/stats.pt",
+        "68ec1eaf016fc6c277911277f148a3d81e0332e7cd2fb133b7fdda3eb66293f6",
+    ),
     # "carton_ncp_seed0":     ("carton_ncp_seed0.pt",     "watermark_experiment/carton/ncp/seed0/ncp.pt", None),
     # "carton_vanilla_seed0": ("carton_vanilla_seed0.pt", "watermark_experiment/carton/vanilla/seed0/vanilla.pt", None),
 }

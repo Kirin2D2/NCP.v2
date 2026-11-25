@@ -168,8 +168,8 @@ prune nothing: `--pruner finetune_only` gives the same fine-tune rounds, and `--
 same rounds through the ablated virtual layer.
 
 **ResNet-50 notebook:** [`notebooks/cnp_resnet_watermark_figures.ipynb`](notebooks/cnp_resnet_watermark_figures.ipynb)
-covers the DRSA matrix, the watermark-subspace check, per-subspace heatmaps, and CNP vs vanilla pruning.
-`python scripts/download_assets.py carton_resnet50_layer3` fetches the runs it plots.
+covers the DRSA matrix, the watermark-subspace check, per-subspace heatmaps, CNP vs vanilla pruning, and an appendix of controls.
+`python scripts/download_assets.py carton_resnet50_layer3 carton_resnet50_layer3_controls` fetches the runs it plots.
 
 **Result (carton, ResNet-50 `layer3`, 5 seeds, pruned to 80% of block-internal channels).** The unpruned
 model classifies watermarked dugongs (c0w1) at 93.9 ± 1.6%. CNP stays at that level throughout pruning
