@@ -1,6 +1,6 @@
 # Concept-aware Network Pruning (CNP)
 
-Check out our [demo notebook](https://colab.research.google.com/github/Kirin2D2/NCP.v2/blob/main/notebooks/cnp_watermark_figures.ipynb) on Colab!
+Check out our [VGG-16 demo notebook](https://colab.research.google.com/github/Kirin2D2/NCP.v2/blob/main/notebooks/cnp_vgg16_watermark_figures.ipynb) on Colab, and the [ResNet-50 notebook](notebooks/cnp_resnet_watermark_figures.ipynb) (experimental, not in the paper).
 
 Code for **"Concept-Aware Pruning via Disentangled Subspaces for Robust Convolutional Networks"**
 (Kirin Danek and Vikram V. Ramaswamy, XAI4CV Workshop at CVPR 2026).
@@ -100,7 +100,7 @@ selected by `--eval_on_test`. The reproduction scripts pass it, so curves are co
 test split. The choice is recorded in each `stats.pt`.
 An example SLURM array is in [`scripts/slurm/watermark_pruning.slurm`](scripts/slurm/watermark_pruning.slurm).
 
-**Colab notebook:** [`notebooks/cnp_watermark_figures.ipynb`](notebooks/cnp_watermark_figures.ipynb)
+**Colab notebook (VGG-16):** [`notebooks/cnp_vgg16_watermark_figures.ipynb`](notebooks/cnp_vgg16_watermark_figures.ipynb)
 runs the paper configuration on a Colab GPU, pruning to 40% by default for speed
 (set `TOTAL_PR = 0.80` for the full schedule). It downloads the data, runs CNP and vanilla pruning per seed
 (resumable, with optional storage in Google Drive), and plots Figures 3–4: overall and worst-subgroup (c0w1)
