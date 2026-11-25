@@ -1,4 +1,4 @@
-## reference: https://github.com/seulkiyeom/LRP_Pruning_toy_example/blob/master/modules/lrp.py 
+## reference: https://github.com/seulkiyeom/LRP_Pruning_toy_example/blob/master/modules/lrp.py
 '''
 Important details / assumptions
 -------------------------------
@@ -6,6 +6,8 @@ Important details / assumptions
 - ReLU and Dropout currently pass relevance unchanged (identity).
 - LogSoftmax case multiplies module.input * R (nonstandard but used in reference).
 - This file assumes hooks were registered so module.input/module.output exist.
+- Strided convolutions/pools: transposed convolutions and max-unpooling are given the exact
+  output size of module.input, so relevance maps keep the input's shape for any stride.
 '''
 import torch
 import torch.nn as nn
@@ -90,7 +92,7 @@ def Linear(module, R, lrp_var=None, param=None):
         # gamma rule
         V_gamma = V + gamma * VP
 
-        X = module.input 
+        X = module.input
 
         Z = torch.nn.functional.linear(X, V_gamma, bias=None) + SMALL_NUMBER
         S = R / Z
@@ -98,7 +100,7 @@ def Linear(module, R, lrp_var=None, param=None):
         Rn = X * C
         return Rn
 
-        
+
 
 
 def Pooling(module, R, lrp_var=None, param=None):
@@ -116,13 +118,16 @@ def Pooling(module, R, lrp_var=None, param=None):
     elif isinstance(module, torch.nn.modules.pooling.MaxPool2d):
         pool = nn.MaxPool2d(module.kernel_size, stride=module.stride, padding=module.padding,
                             dilation=module.dilation, ceil_mode=module.ceil_mode, return_indices=True)
-        unpool = nn.MaxUnpool2d(module.kernel_size, stride=module.stride, padding=module.padding)
 
     Z, indice = pool(module.input)
     S = R / (Z + SMALL_NUMBER)
 
-    C = unpool(S, indice)
-    return module.input * C
+    # Route each window's relevance to its argmax. scatter_add (unlike max-unpooling, which
+    # overwrites) accumulates relevance when overlapping windows share a maximum, e.g. ResNet's
+    # 3x3/stride-2 stem pool; for non-overlapping pools (VGG16) the result is identical.
+    X = module.input
+    C = torch.zeros_like(X).flatten(2).scatter_add_(2, indice.flatten(2), S.flatten(2)).view_as(X)
+    return X * C
 
 def get_normalized_bounds(mean, std, device):
     mean = torch.tensor(mean, device=device).reshape(1, 3, 1, 1)
@@ -132,12 +137,32 @@ def get_normalized_bounds(mean, std, device):
     return lb, hb
 
 
+def _output_padding(module, S):
+    """output_padding for conv_transpose2d(S, ...) to reproduce module.input's spatial size.
+
+    Zero for stride 1; needed for strided convolutions, where several input sizes map to the
+    same output size.
+    """
+    if isinstance(module.padding, str):
+        # 'same' / 'valid' are only allowed by PyTorch for stride 1, where no output_padding is needed
+        return (0, 0)
+    pads = []
+    for dim in range(2):
+        in_size = module.input.shape[-2 + dim]
+        out_size = S.shape[-2 + dim]
+        k, s = module.kernel_size[dim], module.stride[dim]
+        p, d = module.padding[dim], module.dilation[dim]
+        pads.append(in_size - ((out_size - 1) * s - 2 * p + d * (k - 1) + 1))
+    return tuple(pads)
+
+
 def Convolution(module, R, lrp_var=None, param=None):
     R_shape = R.size()
     output_shape = module.output.shape
     if len(R_shape) != 4:
         R = torch.reshape(R, output_shape)
     N, NF, Hout, Wout = R.size()
+    op = _output_padding(module, R)
 
     if lrp_var is None or lrp_var.lower() == 'none' or lrp_var.lower() == 'simple':
         V = module.weight
@@ -145,6 +170,7 @@ def Convolution(module, R, lrp_var=None, param=None):
                                        dilation=module.dilation, groups=module.groups) + SMALL_NUMBER
         S = R / Z
         C = torch.nn.functional.conv_transpose2d(S, V, stride=module.stride, padding=module.padding,
+                                                 output_padding=op,
                                                  dilation=module.dilation, groups=module.groups)
         return module.input * C
 
@@ -166,8 +192,10 @@ def Convolution(module, R, lrp_var=None, param=None):
         SB = beta * R / ZB
 
         CP = torch.nn.functional.conv_transpose2d(SA, VP, stride=module.stride, padding=module.padding,
+                                                 output_padding=op,
                                                  dilation=module.dilation, groups=module.groups)
         CN = torch.nn.functional.conv_transpose2d(SB, VN, stride=module.stride, padding=module.padding,
+                                                  output_padding=op,
                                                   dilation=module.dilation, groups=module.groups)
 
         Rn = X * (CP + CN)
@@ -180,12 +208,9 @@ def Convolution(module, R, lrp_var=None, param=None):
         Z = torch.nn.functional.conv2d(module.input, V, stride=module.stride, padding=module.padding,
                                        dilation=module.dilation, groups=module.groups) + epsilon
         S = R / Z
-        if module.stride[0] > 1:
-            C = torch.nn.functional.conv_transpose2d(S, V, stride=module.stride, padding= module.padding, output_padding=1,
-                                           dilation=module.dilation, groups=module.groups)
-        else:
-            C = torch.nn.functional.conv_transpose2d(S, V, stride=module.stride, padding= module.padding,
-                                           dilation=module.dilation, groups=module.groups)
+        C = torch.nn.functional.conv_transpose2d(S, V, stride=module.stride, padding=module.padding,
+                                                 output_padding=op,
+                                                 dilation=module.dilation, groups=module.groups)
         return module.input * C
 
     elif lrp_var.lower() == 'w^2' or lrp_var.lower() == 'ww':
@@ -196,7 +221,7 @@ def Convolution(module, R, lrp_var=None, param=None):
         #highest = 1.0
         device = module.input.device
 
-        lowest, highest = get_normalized_bounds(MEAN, STD, device=device) ## hardcoded to 3 channels (RGB) 
+        lowest, highest = get_normalized_bounds(MEAN, STD, device=device) ## hardcoded to 3 channels (RGB)
 
         #print(f"Pixel-layer attributions normalized to [{lowest}, {highest}]")
         V = module.weight
@@ -214,14 +239,17 @@ def Convolution(module, R, lrp_var=None, param=None):
         S = R / Z
 
         C = torch.nn.functional.conv_transpose2d(S, V, stride=module.stride, padding=module.padding,
+                                                  output_padding=op,
                                                   dilation=module.dilation, groups=module.groups)
         CP = torch.nn.functional.conv_transpose2d(S, VP, stride=module.stride, padding=module.padding,
+                                                 output_padding=op,
                                                  dilation=module.dilation, groups=module.groups)
         CN = torch.nn.functional.conv_transpose2d(S, VN, stride=module.stride, padding=module.padding,
+                                                  output_padding=op,
                                                   dilation=module.dilation, groups=module.groups)
 
         return X * C - L * CP - H * CN
-    
+
     elif lrp_var.lower() == 'gamma':
         gamma = param
         V = module.weight
@@ -230,22 +258,17 @@ def Convolution(module, R, lrp_var=None, param=None):
         V_gamma = V + gamma * VP
 
         X = module.input
-        Z = torch.nn.functional.conv2d(X, V_gamma, bias=None, stride=module.stride, 
+        Z = torch.nn.functional.conv2d(X, V_gamma, bias=None, stride=module.stride,
                                        padding=module.padding, dilation=module.dilation,
-                                       groups=module.groups) 
+                                       groups=module.groups)
         if LRP_DEBUG:
             print("Z stats:", Z.abs().min(), Z.max(), Z.mean())
             print("X stats:", X.abs().min(), X.max(), X.mean())
             print("weight stats:", module.weight.abs().min(), module.weight.max(), module.weight.norm())
-        
+
 
         S = R / (Z + SMALL_NUMBER)
 
-        ## handle both stride cases in future, only 1x1 for augmented net
-        if module.stride[0] > 1:
-            C = torch.nn.functional.conv_transpose2d(S, V_gamma, bias=None, stride=module.stride, padding=module.padding, 
-                                                   output_padding=1, dilation=module.dilation, groups=module.groups)
-        else:
-            C = torch.nn.functional.conv_transpose2d(S, V_gamma, bias=None, stride=module.stride, padding=module.padding,
-                                                   dilation=module.dilation, groups=module.groups)
+        C = torch.nn.functional.conv_transpose2d(S, V_gamma, bias=None, stride=module.stride, padding=module.padding,
+                                                 output_padding=op, dilation=module.dilation, groups=module.groups)
         return X * C

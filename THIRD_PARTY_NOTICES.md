@@ -10,6 +10,7 @@ apply to the corresponding files and may restrict how this repository can be lic
 | LRP propagation rules | `src/ncp/lrp.py` (adapted) | [seulkiyeom/LRP_Pruning_toy_example](https://github.com/seulkiyeom/LRP_Pruning_toy_example) | CC BY-NC-SA 4.0 — [`licenses/LRP_Pruning_toy_example_LICENSE.txt`](licenses/LRP_Pruning_toy_example_LICENSE.txt) |
 | Structural filter pruning, data loading | `src/ncp/prune_layer.py`, `src/ncp/data.py` (adapted) | [seulkiyeom/LRP_pruning](https://github.com/seulkiyeom/LRP_pruning) | No license file found in the upstream repository |
 | DRSA virtual layer / projection matrices | `src/ncp/AugmentedVGG16.py` (reference implementation), `data/projection_matrices/*.pt` (computed with DRSA), `analysis/carton_crate_lrp_subspaces.py` (imports `cxai`, not redistributed) | [p16i/drsa-demo](https://github.com/p16i/drsa-demo), [p16i/disentangling-explanations](https://github.com/p16i/disentangling-explanations) | No license file found in `drsa-demo` |
+| LRP for ResNet DRSA matrices (optional dependency, `pip install -e ".[drsa]"`) | `experiments/compute_drsa_resnet.py` (imports `zennit`, not redistributed) | [chr5tphr/zennit](https://github.com/chr5tphr/zennit) | LGPL-3.0 |
 | Source Han Serif SC ExtraLight font | `src/ncp/fonts/SourceHanSerifSC-ExtraLight.otf` | [adobe-fonts/source-han-serif](https://github.com/adobe-fonts/source-han-serif) | SIL Open Font License 1.1 — [`src/ncp/fonts/LICENSE.txt`](src/ncp/fonts/LICENSE.txt) |
 
 ## Data

@@ -69,6 +69,8 @@ def test_watermark_experiment_end_to_end(watermark_experiment, tmp_path, monkeyp
     stats = torch.load(run_dir / "stats.pt", map_location="cpu", weights_only=False)
     n_iter = int(int(PRUNABLE / int(PRUNABLE * 0.05)) * total_pr)
     assert stats["eval_iter"] == list(range(n_iter + 2))     # baseline, each iteration, final
+    assert stats["complete"] is True
+    assert not (run_dir / "stats.partial.pt").exists()      # removed once stats.pt is written
 
     model, info = load_pruned_checkpoint(run_dir / f"{pruner}.pt")
     channels = info["channels"]
