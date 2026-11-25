@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this code, please cite the paper below."
 title: "Concept-aware Network Pruning (CNP)"
-repository-code: "https://github.com/KirinDanek/NCP.v2"
+repository-code: "https://github.com/Kirin2D2/NCP.v2"
 authors:
   - family-names: Danek
     given-names: Kirin

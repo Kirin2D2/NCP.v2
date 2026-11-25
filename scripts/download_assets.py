@@ -1,13 +1,14 @@
 """
-Download released CNP assets (pruned checkpoints and the paper's stats.pt files) into results/.
+Download released CNP assets (pruned checkpoints and stats.pt files) into results/.
 
-Assets are published as release files; fill in RELEASE_BASE_URL and ASSETS when they are uploaded.
+Assets are published as GitHub release files. A ``.zip`` asset is unpacked into results/ (its member
+paths are relative to results/); any other file is saved at its destination.
 Checkpoints load on CPU or GPU with ncp.checkpoint.load_pruned_checkpoint.
 
 Usage
 -----
   python scripts/download_assets.py --list
-  python scripts/download_assets.py carton_ncp_seed0 carton_vanilla_seed0
+  python scripts/download_assets.py carton_resnet50_layer3
   python scripts/download_assets.py --all
 """
 
@@ -15,15 +16,24 @@ import argparse
 import hashlib
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 from ncp.paths import RESULTS_ROOT
 
-# e.g. "https://github.com/KirinDanek/NCP.v2/releases/download/v1.0.0"
-RELEASE_BASE_URL = None
+RELEASE_BASE_URL = "https://github.com/Kirin2D2/NCP.v2/releases/download/resnet50-v1"
 
-# name -> (file name in the release, destination relative to RESULTS_ROOT, sha256 or None)
+# name -> (file name in the release, destination relative to RESULTS_ROOT, sha256 or None).
+# For a .zip the destination is a file inside the archive, used to tell whether it is already unpacked.
 ASSETS = {
+    # ResNet-50 carton watermark runs read by notebooks/cnp_resnet_watermark_figures.ipynb: CNP and vanilla
+    # (5 seeds each), the first-step BatchNorm checks, the fine-tune-through-the-ablated-layer reference,
+    # the DRSA watermark checks and the 1000-class pretrained subgroup accuracies.
+    "carton_resnet50_layer3": (
+        "carton_resnet50_layer3_results.zip",
+        "watermark_experiment_bn_reestimate/carton_resnet50_layer3/ncp/seed0/stats.pt",
+        "265272f59575d53eb98f6a1d5fd5ebc3b3f55edb837dce6486dfb2f5c7fceace",
+    ),
     # "carton_ncp_seed0":     ("carton_ncp_seed0.pt",     "watermark_experiment/carton/ncp/seed0/ncp.pt", None),
     # "carton_vanilla_seed0": ("carton_vanilla_seed0.pt", "watermark_experiment/carton/vanilla/seed0/vanilla.pt", None),
 }
@@ -51,6 +61,17 @@ def download(name: str, force: bool = False) -> Path:
     if sha256 is not None and _sha256(tmp) != sha256:
         tmp.unlink()
         raise RuntimeError(f"checksum mismatch for {name}")
+    if remote.endswith(".zip"):
+        root = RESULTS_ROOT.resolve()
+        with zipfile.ZipFile(tmp) as z:
+            for member in z.namelist():
+                target = (root / member).resolve()
+                if root not in target.parents:
+                    raise RuntimeError(f"unsafe path {member!r} in {remote}")
+            z.extractall(root)
+            print(f"[ok]   unpacked {len(z.namelist())} files into {root}")
+        tmp.unlink()
+        return dest
     tmp.replace(dest)
     print(f"[ok]   {dest}")
     return dest

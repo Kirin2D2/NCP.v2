@@ -58,7 +58,7 @@ Vanilla LRP pruning (the baseline) is the same loop on a plain VGG-16 (`VanillaV
 ## Installation
 
 ```bash
-git clone https://github.com/KirinDanek/NCP.v2.git
+git clone https://github.com/Kirin2D2/NCP.v2.git
 cd NCP.v2
 # install PyTorch for your platform first (https://pytorch.org), then:
 pip install -e ".[dev,data]"
@@ -133,6 +133,11 @@ The watermark experiment also runs CNP on torchvision ResNet-18/34/50 (`--arch`)
 - **What gets pruned.** Only channels internal to a block: `conv1` in basic blocks, `conv1`/`conv2` in bottlenecks.
   Residual-stream channels are shared across a stage through the additions and fix D, so they stay intact.
   This is the ResNet analogue of keeping `conv4_3` in VGG-16.
+- **BatchNorm.** Before the head warmup, BatchNorm running statistics are re-estimated on the training set
+  (`--warmup_bn reestimate`, the default) and then kept frozen while the head trains. This removes a jump that
+  appears otherwise: with ImageNet statistics, c0w1 starts near 51% and rises to about 95% after the first
+  fine-tune round, only because that round adapts BatchNorm. With re-estimated statistics, the unpruned model
+  is already at about 93% before fine-tuning. VGG-16 has no BatchNorm and is unaffected.
 - **LRP.** Conv+BatchNorm pairs are fused and use LRP-α1β0 (zB at the stem). Residual additions split relevance in
   proportion to each path's positive contribution. Global average pooling redistributes relevance in
   proportion to the activations. See `src/ncp/lrp_resnet.py`.
@@ -145,18 +150,36 @@ The watermark experiment also runs CNP on torchvision ResNet-18/34/50 (`--arch`)
   - Subspaces sorted by relevance.
 
   It needs `pip install -e ".[drsa]"` and a clone of [drsa-demo](https://github.com/p16i/drsa-demo) next to this repo
-  (or `--drsa_demo_dir`). Run `--check` to verify that the γ = 0 context equals the gradient. Which subspace holds the
-  watermark has to be identified from the learned subspaces before choosing `--spurious_subspace`.
+  (or `--drsa_demo_dir`). Run `--check` to verify that the γ = 0 context equals the gradient. The committed
+  matrix `data/projection_matrices/U_carton_resnet50_layer3.pt` (4 subspaces of 256 dims) has the watermark in
+  subspace 3 (0-indexed; subspace 4 in the paper's 1-indexed convention). For a new matrix, identify the
+  watermark subspace with `analysis/drsa_watermark_subspace_check.py` before choosing `--spurious_subspace`.
 
 ```bash
 python experiments/compute_drsa_resnet.py --experiment carton        # -> data/projection_matrices/U_carton_resnet50_layer3.pt
 python experiments/run_watermark_pruning_experiment.py --experiment carton --pruner ncp \
     --arch resnet50 --virtual_layer layer3 --u_filepath data/projection_matrices/U_carton_resnet50_layer3.pt \
-    --spurious_subspace <k> --eval_on_test
-python experiments/run_watermark_pruning_experiment.py --experiment carton --pruner vanilla --arch resnet50 --eval_on_test
+    --spurious_subspace 3 --pr_step 0.05 --total_pr 0.80 --eval_on_test
+python experiments/run_watermark_pruning_experiment.py --experiment carton --pruner vanilla \
+    --arch resnet50 --virtual_layer layer3 --pr_step 0.05 --total_pr 0.80 --eval_on_test
 ```
-Results are written to `results/watermark_experiment/carton_resnet50/{ncp,vanilla}/seed{N}/`
-(`plot_watermark_results.py --experiments carton_resnet50`).
+Results are written to `results/watermark_experiment/carton_resnet50_layer3/{ncp,vanilla}/seed{N}/`. Two controls
+prune nothing: `--pruner finetune_only` gives the same fine-tune rounds, and `--pruner finetune_ablated` gives the
+same rounds through the ablated virtual layer.
+
+**ResNet-50 notebook:** [`notebooks/cnp_resnet_watermark_figures.ipynb`](notebooks/cnp_resnet_watermark_figures.ipynb)
+covers the DRSA matrix, the watermark-subspace check, per-subspace heatmaps, and CNP vs vanilla pruning.
+`python scripts/download_assets.py carton_resnet50_layer3` fetches the runs it plots.
+
+**Result (carton, ResNet-50 `layer3`, 5 seeds, pruned to 80% of block-internal channels).** The unpruned
+model classifies watermarked dugongs (c0w1) at 93.9 ± 1.6%. CNP stays at that level throughout pruning
+(95.5 ± 0.9% after the final fine-tune). Vanilla pruning drifts to 57.1 ± 4.4%, and CNP is higher at every
+pruning step for every seed. Caveats:
+- About 27% of the annotated carton test images carry natural watermarks; the train/val splits are not annotated.
+- The pruning ratio counts only block-internal channels. The residual stream is not pruned.
+- The ImageNet-pretrained ResNet-50 already relies on the watermark. With the 1000-class head, watermarked
+  dugongs score higher on dugong than on carton only 58.7% of the time (99.1% for VGG-16), and top-1 accuracy
+  on dugong drops from 98.6% to 48.2% when the watermark is added.
 
 ## Pruned checkpoints
 
@@ -169,8 +192,9 @@ model, info = load_pruned_checkpoint("carton/ncp/seed0/ncp.pt")   # CNP and vani
 print(info["channels"], info["meta"])
 ```
 
-Checkpoints and `stats.pt` files for the paper runs will be published as release assets and can be
-fetched with `python scripts/download_assets.py --all`.
+Checkpoints and `stats.pt` files are published as release assets and can be fetched with
+`python scripts/download_assets.py --all` (`--list` shows what is available). So far this covers the
+ResNet-50 runs; the paper's VGG-16 runs will follow.
 
 ## Repository layout
 ```
@@ -197,6 +221,7 @@ tests/              CPU unit tests (pruning surgery, LRP, ranking, splits, check
 This code builds on [LRP_pruning](https://github.com/seulkiyeom/LRP_pruning) /
 [LRP_Pruning_toy_example](https://github.com/seulkiyeom/LRP_Pruning_toy_example) (Yeom et al.),
 [drsa-demo](https://github.com/p16i/drsa-demo) / [disentangling-explanations](https://github.com/p16i/disentangling-explanations)
-(Chormai et al.), and [Whac-A-Mole](https://github.com/facebookresearch/Whac-A-Mole) (watermark transform).
+(Chormai et al.), [Zennit](https://github.com/chr5tphr/zennit) (optional, for ResNet DRSA matrices; LGPL-3.0, not
+redistributed), and [Whac-A-Mole](https://github.com/facebookresearch/Whac-A-Mole) (watermark transform).
 Some of these components are licensed for **non-commercial use only**. See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
